@@ -335,8 +335,7 @@ level = 15
 
     #[test]
     fn admin_config_can_still_turn_management_off() {
-        let cfg =
-            parse("version=1\n[[root]]\npath='/x'\n[projects.other]\nmanaged = false\n", "t").unwrap();
+        let cfg = parse("version=1\n[[root]]\npath='/x'\n[projects.other]\nmanaged = false\n", "t").unwrap();
         let dir = tempfile::tempdir().unwrap();
         let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), None).unwrap();
         assert!(!e.managed);

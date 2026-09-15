@@ -90,15 +90,24 @@ pub fn apply(
             }
         }
     }
+    // on a second freeze the reference stays the state from the first one, while the snapshot just
+    // held is the last good one before *this* shrink: name each for what it is
     let ref_snap = st.frozen.as_ref().and_then(|f| f.ref_snap);
+    let held = last_good_id.or(ref_snap);
+    let show = |id: Option<u64>, fallback: &str| id.map(|i| i.to_string()).unwrap_or_else(|| fallback.into());
+    let also = match (held, ref_snap) {
+        (Some(h), Some(r)) if h != r => format!(" The reference since the freeze began is #{r}."),
+        _ => String::new(),
+    };
     tracing::error!(
-        "{}: shrink detected in snapshot #{}: {}. Cleanup is frozen; last good snapshot #{} is held. Resolve with `bpm rollback {} {}` or `bpm unfreeze {}`.",
+        "{}: shrink detected in snapshot #{}: {}. Cleanup is frozen; last good snapshot #{} is held.{} Resolve with `bpm rollback {} {}` or `bpm unfreeze {}`.",
         t.name,
         new.id,
         reasons.join("; "),
-        ref_snap.map(|i| i.to_string()).unwrap_or_else(|| "?".into()),
+        show(held, "?"),
+        also,
         t.name,
-        ref_snap.map(|i| i.to_string()).unwrap_or_else(|| "<snapshot>".into()),
+        show(held, "<snapshot>"),
         t.name
     );
     let before = reference.files.to_string();

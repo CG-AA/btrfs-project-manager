@@ -473,7 +473,16 @@ fn relink_renamed(store: &Store, disc: &project::Discovery, rt: &mut RootTick) -
                 tracing::error!("cannot relink {from} -> {name}: {} exists", aside.dir.display());
                 continue;
             }
-            let moved = target.lock(PROJECT_LOCK)?.rename_to(aside)?;
+            // busy is transient: leave the entry parked and relink on a later tick rather than
+            // failing every remaining project in this root
+            let moved = match target.lock(PROJECT_LOCK) {
+                Ok(l) => l.rename_to(aside)?,
+                Err(e) if is_busy(&e) => {
+                    tracing::info!("{name}: busy; relink {from} -> {name} next tick");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             rec.name = moved.name.clone();
             moved.write_record(&rec)?;
             tracing::warn!("store entry {name} moved to {} to make room for renamed project", moved.name);

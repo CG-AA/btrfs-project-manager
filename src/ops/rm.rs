@@ -103,7 +103,7 @@ pub fn forget(ctx: &Ctx, a: ForgetArgs) -> Result<()> {
         )));
     }
     // only bpm's own files: never recurse into a snapshot subvolume
-    for f in ["project.toml", "state.toml", "FROZEN", "op.journal", "lock"] {
+    for f in ["project.toml", "state.toml", "FROZEN", "op.journal"] {
         if pref.unit.dir.join(f).exists() {
             let _ = ctx.fs.remove_file(&pref.unit.dir.join(f));
         }
@@ -112,6 +112,11 @@ pub fn forget(ctx: &Ctx, a: ForgetArgs) -> Result<()> {
         if e.file_type().is_ok_and(|t| t.is_dir()) {
             let _ = ctx.fs.remove_dir(&e.path());
         }
+    }
+    // last, and still under the lock: once it is gone another holder would lock a new inode, so
+    // the directory it guards must go immediately after
+    if pref.unit.dir.join("lock").exists() {
+        let _ = ctx.fs.remove_file(&pref.unit.dir.join("lock"));
     }
     ctx.fs
         .remove_dir(&pref.unit.dir)

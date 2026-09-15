@@ -120,6 +120,9 @@ pub fn run(ctx: &Ctx, a: MigrateArgs) -> Result<()> {
             let back = ctx.btrfs.set_readonly(if moved.is_ok() { &dst } else { &snap }, true);
             if let Err(e) = moved {
                 let _ = std::fs::remove_dir_all(&tmp);
+                if let Err(ro) = back {
+                    tracing::error!("{} was left writable: {ro:#}", snap.display());
+                }
                 return Err(e.context(format!("import snapper #{n}; it stays in {}", snap.display())));
             }
             back?;
