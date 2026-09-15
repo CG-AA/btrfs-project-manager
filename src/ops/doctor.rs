@@ -44,6 +44,19 @@ impl Doc<'_> {
     /// Record a fixable problem and run `f` when --fix was given.
     fn fixable(&mut self, level: &'static str, what: String, fix: String, f: impl FnOnce() -> Result<()>) {
         let mut fixed = false;
+        if self.fix && self.ctx.opts.dry_run {
+            // the fix runs against the dry-run backends, so it only logs what it would do
+            if let Err(e) = f() {
+                self.out.push(Finding {
+                    level: "error",
+                    what: format!("[dry-run] fix would fail for {what}: {e:#}"),
+                    fix: None,
+                    fixed: false,
+                });
+            }
+            self.out.push(Finding { level, what, fix: Some(format!("[dry-run] would run: {fix}")), fixed: false });
+            return;
+        }
         if self.fix {
             match f() {
                 Ok(()) => fixed = true,
@@ -241,6 +254,7 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
         }
     }
     check_claude_hook(&mut d);
+    check_snap_sudo(&mut d);
     let problems = d.out.iter().filter(|f| matches!(f.level, "warn" | "error") && !f.fixed).count();
     emit(ctx, &d.out, || {
         let mut t = Table::new(&["", "FINDING", "FIX"]);
@@ -366,7 +380,7 @@ fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crat
                     "error",
                     format!("{}: rollback was interrupted before the new tree existed", path.display()),
                     format!("doctor --fix renames it back to {}", orig.display()),
-                    || Ok(std::fs::rename(&p, &o)?),
+                    || ctx.fs.rename(&p, &o),
                 );
             }
             Leftover::Rollback { ref base } => {
@@ -461,7 +475,7 @@ fn check_unit(d: &mut Doc, unit: &Unit) {
                     j.data.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
                 ),
                 "doctor --fix clears the journal after the leftover checks above".into(),
-                || Ok(std::fs::remove_file(Journal::path_in(&dir))?),
+                || ctx.fs.remove_file(&Journal::path_in(&dir)),
             );
         }
     }
@@ -513,6 +527,34 @@ fn recover_meta(ctx: &Ctx, unit: &Unit, id: u64, path: &Path) -> Result<()> {
         origin: ctx.origin(),
     };
     unit.write_meta_in(&unit.snapshot_dir(id), &meta)
+}
+
+/// As a normal user: can the Claude hook's `sudo -n bpm snap …` run without a password?
+fn check_snap_sudo(d: &mut Doc) {
+    if crate::privilege::is_root() || d.ctx.opts.no_sudo || !d.ctx.cfg.global.sudo {
+        return;
+    }
+    let args: Vec<std::ffi::OsString> = ["snap", "doctor-probe", "--kind", "hook"].iter().map(Into::into).collect();
+    let Ok(probe) = crate::privilege::self_command(&args, d.ctx.opts.config.as_deref(), true) else {
+        return;
+    };
+    // `sudo -n -l <command…>` only checks whether the command is allowed
+    let argv: Vec<std::ffi::OsString> = probe.get_args().map(|a| a.to_os_string()).collect();
+    let allowed = Command::new("sudo")
+        .arg("-n")
+        .arg("-l")
+        .args(argv.iter().skip(2))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if allowed {
+        d.ok("passwordless sudo allows `bpm snap` (hook and wrap snapshots work)");
+    } else {
+        d.warn(
+            "`sudo -n bpm snap …` needs a password: Claude hook and `bpm wrap` snapshots are skipped",
+            Some("see docs/OPERATIONS.md (sudoers line for `bpm snap *`)".into()),
+        );
+    }
 }
 
 fn check_claude_hook(d: &mut Doc) {

@@ -8,9 +8,14 @@ AI agents, without paying for build output in every snapshot.
   subvolumes**, which btrfs snapshots skip. `cargo clean` and `rm -rf build` keep working; bpm
   recreates the directory afterwards.
 - A systemd timer runs `bpm tick` every 5 minutes. A project is snapshotted only when its content
-  actually changed, detected exactly from btrfs transaction counters.
-- A **shrink guard** notices when a project suddenly loses files, bytes, or a sentinel such as
-  `.git`. It pins the last good snapshot and freezes all cleanup until you decide.
+  actually changed, detected exactly from btrfs transaction counters. Slow work (adoption,
+  recompression) runs from a second timer, so it never delays snapshots.
+- A **shrink guard** checks every snapshot, including the quick ones taken by the agent hook, and
+  notices when a project suddenly loses files, bytes, or a sentinel such as `.git`. It pins the
+  last snapshot that passes the check and freezes all cleanup until you decide.
+- Nothing bpm replaces (the original directory after adoption, the tree before a rollback, a file
+  overwritten by restore) is deleted unless bpm can prove it holds nothing newer; otherwise it is
+  kept as `<name>.bpm-keep-*` for you to inspect.
 - Deleting a whole project is noticed too: its snapshots are kept and `bpm restore <name> --recreate`
   brings it back.
 - Idle projects age: after 14 days only a thinned history remains; after 60 days they collapse to
@@ -27,7 +32,7 @@ cannot take them along and an unprivileged agent cannot delete them.
 # cargo is not on PATH on this machine; either restore rustup shims or point at a toolchain:
 export CARGO=$HOME/.rustup/toolchains/nightly-2026-05-26-x86_64-unknown-linux-gnu/bin/cargo
 PATH=$(dirname $CARGO):$PATH scripts/install.sh      # builds release, installs /usr/local/bin/bpm
-sudo bpm setup                                       # /etc/bpm/config.toml, /space/.bpm, systemd timer
+sudo bpm setup                                       # /etc/bpm/config.toml, /space/.bpm, systemd timers
 bpm doctor
 ```
 
@@ -39,7 +44,7 @@ Commands that change anything re-exec themselves through `sudo -n`. Read-only co
 ```sh
 bpm status                        # managed projects, stages, freezes, unadopted directories
 bpm migrate-from-snapper          # stop snapper's timeline on /space
-bpm adopt --all                   # or let the timer adopt one project per tick
+bpm adopt --all                   # or let the timer adopt them one at a time
 bpm setup --print-claude-hook     # paste into ~/.claude/settings.json
 ```
 

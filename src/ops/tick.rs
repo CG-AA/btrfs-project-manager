@@ -370,7 +370,7 @@ fn adopt_candidate(ctx: &Ctx, root: &RootCfg, store: &Store, disc: &project::Dis
 /// Remove stale `<id>.tmp` dirs and metadata whose snapshot is gone. A unit whose lock is held
 /// is skipped: its owner may still be writing into a tmp dir (a long `btrfs receive`).
 pub fn cleanup_unit(ctx: &Ctx, unit: &Unit) -> Result<()> {
-    if ctx.opts.dry_run || !unit.dir.exists() {
+    if !unit.dir.exists() {
         return Ok(());
     }
     let lu = match unit.lock(Duration::ZERO) {
@@ -410,11 +410,11 @@ pub fn cleanup_unit(ctx: &Ctx, unit: &Unit) -> Result<()> {
             }
             ctx.btrfs.delete_subvolume(&snap, false)?;
         }
-        std::fs::remove_dir_all(&tmp)?;
+        ctx.fs.remove_dir_all(&tmp)?;
         tracing::info!("{}: removed stale {}", lu.name, tmp.display());
     }
     for id in scan.without_snapshot {
-        std::fs::remove_dir_all(lu.snapshot_dir(id))?;
+        ctx.fs.remove_dir_all(&lu.snapshot_dir(id))?;
         tracing::info!("{}: removed metadata of vanished snapshot #{id}", lu.name);
     }
     Ok(())
@@ -676,6 +676,14 @@ fn project_step(ctx: &Ctx, pref: &ProjectRef, f: &Found, heavy: &mut Vec<Heavy>)
     let eff = super::effective(ctx, pref)?;
     let mut st = lu.read_state()?;
     let now = ctx.now();
+    if !eff.ignored_project_keys.is_empty() && !st.warned.contains_key("bpm-toml-ignored") {
+        tracing::warn!(
+            "{}: .bpm.toml sets {}, which only the admin config may change; ignored",
+            f.name,
+            eff.ignored_project_keys.join(", ")
+        );
+        st.warned.insert("bpm-toml-ignored".into(), now);
+    }
     if !eff.managed {
         pt.stage = format!("{} (managed = false)", st.stage);
         return Ok(pt);

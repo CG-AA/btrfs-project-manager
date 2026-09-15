@@ -157,13 +157,14 @@ pub fn run(ctx: &Ctx, a: StatusArgs) -> Result<()> {
             if !r.unadopted.is_empty() {
                 out.push_str(&format!("\nunadopted (plain directories, not protected): {}\n", r.unadopted.join(", ")));
             }
-            if a.unadopted {
-                if !r.foreign_subvolumes.is_empty() {
-                    out.push_str(&format!("subvolumes not managed by bpm: {}\n", r.foreign_subvolumes.join(", ")));
-                }
-                if !r.ignored.is_empty() {
-                    out.push_str(&format!("ignored: {}\n", r.ignored.join(", ")));
-                }
+            if !r.foreign_subvolumes.is_empty() {
+                out.push_str(&format!(
+                    "subvolumes not managed by bpm (not protected; `bpm adopt <name>` registers them): {}\n",
+                    r.foreign_subvolumes.join(", ")
+                ));
+            }
+            if a.unadopted && !r.ignored.is_empty() {
+                out.push_str(&format!("ignored: {}\n", r.ignored.join(", ")));
             }
             if !r.leftovers.is_empty() {
                 let l: Vec<String> = r.leftovers.iter().map(|p| p.display().to_string()).collect();

@@ -116,7 +116,7 @@ pub fn run(ctx: &Ctx, a: MigrateArgs) -> Result<()> {
             // a read-only subvolume cannot move to another directory (its `..` is read-only)
             let dst = tmp.join("snapshot");
             ctx.btrfs.set_readonly(&snap, false)?;
-            let moved = crate::util::fs::rename_strict(&snap, &dst);
+            let moved = ctx.fs.rename(&snap, &dst);
             let back = ctx.btrfs.set_readonly(if moved.is_ok() { &dst } else { &snap }, true);
             if let Err(e) = moved {
                 let _ = std::fs::remove_dir_all(&tmp);
@@ -124,7 +124,7 @@ pub fn run(ctx: &Ctx, a: MigrateArgs) -> Result<()> {
             }
             back?;
             std::fs::rename(&tmp, unit.snapshot_dir(id))?;
-            let _ = std::fs::remove_dir_all(snap.parent().unwrap());
+            let _ = ctx.fs.remove_dir_all(snap.parent().unwrap());
         }
     }
 

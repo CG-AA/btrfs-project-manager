@@ -9,6 +9,11 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Policy tables `<project>/.bpm.toml` may not set: the file is writable by whatever works in the
+/// repository (an AI agent included), and these decide whether deletions are noticed and how
+/// long history is kept. Set them in the admin config (`[projects."name".policy]`).
+pub const PROTECTED_FROM_PROJECT_FILE: &[&str] = &["shrink_guard", "thin"];
+
 pub const POLICY_KEYS: &[&str] = &[
     "banlist_precreate",
     "banlist_settle",
@@ -32,6 +37,8 @@ pub struct EffectiveConfig {
     pub sentinels: Vec<String>,
     pub policy: Policy,
     pub origins: BTreeMap<String, String>,
+    /// `.bpm.toml` policy tables that were ignored (see `PROTECTED_FROM_PROJECT_FILE`).
+    pub ignored_project_keys: Vec<String>,
 }
 
 impl EffectiveConfig {
@@ -165,13 +172,22 @@ pub fn effective_for(
 
     let mut remove: Vec<String> = Vec::new();
     let mut sentinels_add = str_list(&cfg.defaults, "sentinels_add");
+    let mut ignored_project_keys = Vec::new();
     for (layer, origin) in [(global_over, format!("projects.{name}")), (file, ".bpm.toml".to_string())] {
         if let Some(o) = layer {
             banlist.extend(o.banlist_add.iter().cloned());
             primary.extend(o.banlist_add.iter().cloned());
             remove.extend(o.banlist_remove.iter().cloned());
             sentinels_add.extend(o.sentinels_add.iter().cloned());
-            deep_merge(&mut table, &o.policy, &origin, "", &mut origins);
+            let mut policy = o.policy.clone();
+            if origin == ".bpm.toml" {
+                for key in PROTECTED_FROM_PROJECT_FILE {
+                    if policy.remove(*key).is_some() {
+                        ignored_project_keys.push(format!("policy.{key}"));
+                    }
+                }
+            }
+            deep_merge(&mut table, &policy, &origin, "", &mut origins);
         }
     }
 
@@ -201,6 +217,7 @@ pub fn effective_for(
         sentinels,
         policy,
         origins,
+        ignored_project_keys,
     })
 }
 
@@ -257,6 +274,22 @@ level = 15
         assert_eq!(e.origins["recompress.level"], "projects.demo");
         assert_eq!(e.origins["thin.hourly"], "builtin");
         assert!(e.managed);
+        assert!(e.ignored_project_keys.is_empty());
+    }
+
+    #[test]
+    fn project_file_cannot_weaken_the_guard_or_retention() {
+        let cfg = parse(CFG, "t").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file: ProjectOverride = toml::from_str(
+            "[policy.shrink_guard]\nenabled = false\n[policy.thin]\nkeep_all = '0s'\n[policy.lifecycle]\ndormant_after = '30d'\n",
+        )
+        .unwrap();
+        let e = effective_for(&cfg, &cfg.roots[0], "demo", dir.path(), Some(&file)).unwrap();
+        assert!(e.policy.shrink_guard.enabled);
+        assert_eq!(e.policy.thin.keep_all, Duration::from_secs(12 * 3600));
+        assert_eq!(e.policy.lifecycle.dormant_after, Duration::from_secs(30 * 86400), "other tables still apply");
+        assert_eq!(e.ignored_project_keys, vec!["policy.shrink_guard", "policy.thin"]);
     }
 
     #[test]

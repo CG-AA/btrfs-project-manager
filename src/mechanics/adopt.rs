@@ -10,7 +10,7 @@ use crate::hooks::{self, HookCtx, HookEvent};
 use crate::project::{self, ProjectRef};
 use crate::store::journal::Journal;
 use crate::store::{ProjectRecord, ProjectState, SnapshotKind, Store};
-use crate::util::fs::{copy_owner_mode, cp_a, rename_exchange, sibling};
+use crate::util::fs::{copy_owner_mode, cp_a, sibling};
 use crate::util::relpath::RelPath;
 use crate::util::{proc, walk};
 use anyhow::{Context, Result, bail};
@@ -211,7 +211,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
                     continue;
                 };
                 if p.symlink_metadata().is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
-                    std::fs::remove_dir_all(&p)?;
+                    ctx.fs.remove_dir_all(&p)?;
                 }
             }
             journal.step(3)?;
@@ -299,8 +299,8 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
             return Err(e.context(format!("adopt {name}: copy into new subvolume failed; original untouched")));
         }
         journal.step(5)?;
-        rename_exchange(&path, &tmp).with_context(|| format!("swap {} into place", path.display()))?;
-        std::fs::rename(&tmp, &old)?;
+        ctx.fs.rename_exchange(&path, &tmp).with_context(|| format!("swap {} into place", path.display()))?;
+        ctx.fs.rename(&tmp, &old)?;
     }
 
     journal.step(6)?;

@@ -54,7 +54,7 @@ directory. The steps below hand `/space` to bpm. snapper keeps managing `/`, `/h
    ```
 
    If you used `--import`, the space is freed only when you remove the imported snapshots:
-   `sudo bpm rm --container @container <id>... --force-held`.
+   `sudo bpm rm --container <id>... --force-held`.
 
 5. Add the Claude Code hook: `bpm setup --print-claude-hook`, then paste into
    `~/.claude/settings.json`.
@@ -119,7 +119,15 @@ directory was inside. Compare it with the project, copy back what you need, then
 - Snapshots are on the same disk. They protect against deletion and overwrites, not disk failure.
   `/archives` is on the same filesystem too; copy archive files off the machine for backups.
 - Anything with passwordless sudo, including an agent running as your user, can delete snapshots.
-  To close that gap, restrict the agent's sudo to `bpm snap`.
+  To close that gap, allow only `bpm snap` without a password, for example in
+  `/etc/sudoers.d/bpm`:
+
+  ```
+  lamb ALL=(root) NOPASSWD: /usr/local/bin/bpm snap *
+  ```
+
+  bpm's own re-executions (the Claude hook, `bpm wrap`) keep `snap` as the first argument so
+  this rule matches; `bpm doctor` checks it.
 - Nested subvolumes you create inside a project yourself are not covered by its snapshots.
   `bpm status <project>` warns about them.
 - Snapshots are crash-consistent. Databases that need a clean state can use a `pre-snapshot` hook.

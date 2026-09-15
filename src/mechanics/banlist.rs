@@ -5,7 +5,7 @@ use crate::config::{EffectiveConfig, Precreate};
 use crate::ctx::Ctx;
 use crate::error::refused;
 use crate::store::ProjectState;
-use crate::util::fs::{copy_owner_mode, cp_a, dir_is_empty, rename_exchange, set_owner_mode, sibling};
+use crate::util::fs::{copy_owner_mode, cp_a, dir_is_empty, set_owner_mode, sibling};
 use crate::util::proc;
 use crate::util::relpath::RelPath;
 use anyhow::{Context, Result, bail};
@@ -97,7 +97,7 @@ pub fn enforce_cheap(
                         out.push(BanAction::Recreated(rel.clone()));
                         continue;
                     }
-                    match std::fs::remove_dir(&full) {
+                    match ctx.fs.remove_dir(&full) {
                         Ok(()) => {
                             ctx.btrfs.create_subvolume(&full)?;
                             copy_owner_mode(&md, &full)?;
@@ -170,8 +170,8 @@ pub fn convert(ctx: &Ctx, live: &Path, rel: &str, keep_contents: bool, force: bo
             Some(crate::util::walk::tree_stats(&tmp, &probe, &[], &[], std::time::Duration::from_secs(24 * 3600))?);
     }
     let _ = super::xattr::copy_times(&full, &tmp);
-    rename_exchange(&full, &tmp)?;
-    std::fs::rename(&tmp, &old)?;
+    ctx.fs.rename_exchange(&full, &tmp)?;
+    ctx.fs.rename(&tmp, &old)?;
     let expect = Expect::Tree { stats: copied, not_after: started, exclude: vec![] };
     if let Outcome::Kept(k) = retire::retire(ctx, &old, &expect, &[], "convert")? {
         tracing::warn!("{}: previous contents kept at {}", full.display(), k.display());

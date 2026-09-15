@@ -15,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[derive(Serialize, Debug)]
 pub struct SnapResult {
@@ -304,20 +304,11 @@ fn claude_hook(ctx: &Ctx, _a: &SnapArgs) -> Result<()> {
             args.push("--throttle".into());
             args.push(humantime::format_duration(ctx.cfg.global.hook_throttle).to_string());
         }
-        let exe = std::env::current_exe()?;
-        let mut cmd = if crate::privilege::is_root() || ctx.opts.no_sudo {
-            let mut c = Command::new(exe);
-            c.arg("--no-sudo");
-            c
-        } else {
-            let mut c = Command::new("sudo");
-            c.arg("-n").arg("--").arg(exe).arg("--no-sudo");
-            c
-        };
-        if let Some(cfg) = ctx.opts.config.clone().or_else(|| std::env::var_os("BPM_CONFIG").map(Into::into)) {
-            cmd.arg("--config").arg(cfg);
-        }
-        let status = cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).status();
+        let config = ctx.opts.config.clone().or_else(|| std::env::var_os("BPM_CONFIG").map(Into::into));
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        let via_sudo = !(crate::privilege::is_root() || ctx.opts.no_sudo);
+        let mut cmd = crate::privilege::self_command(&args, config.as_deref(), via_sudo)?;
+        let status = cmd.stdin(Stdio::null()).stdout(Stdio::null()).status();
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => eprintln!("bpm: hook snapshot of {name} exited with {s}"),

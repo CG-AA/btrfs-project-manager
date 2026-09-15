@@ -60,6 +60,11 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
     let level = a.level.unwrap_or(ctx.cfg.global.archive_zstd_level);
     let report = archive::archive(ctx, &pref, &meta, nested, &dest, level, a.fast)?;
     if ctx.opts.dry_run {
+        emit(
+            ctx,
+            &serde_json::json!({"dry_run": true, "project": pref.name(), "snapshot": meta.id, "archive": report}),
+            || format!("[dry-run] {}: would archive snapshot #{} to {}", pref.name(), meta.id, report.file.display()),
+        );
         return Ok(());
     }
     st.archives.push(crate::store::ArchiveRecord {
@@ -143,6 +148,29 @@ pub fn unarchive(ctx: &Ctx, a: UnarchiveArgs) -> Result<()> {
         None => archive::newest_archive(&dest, &a.project)?,
     };
     let manifest = archive::read_manifest(&file)?;
+    if manifest.project.is_empty()
+        || manifest.project.starts_with('.')
+        || manifest.project.contains('/')
+        || project::is_leftover_name(&manifest.project)
+    {
+        return Err(refused(format!("{}: manifest names an invalid project {:?}", file.display(), manifest.project)));
+    }
+    if ctx.opts.dry_run {
+        archive::verify(&file, &manifest)?;
+        emit(
+            ctx,
+            &serde_json::json!({"dry_run": true, "project": a.project, "archive": file, "recreate": !a.no_live}),
+            || {
+                format!(
+                    "[dry-run] {}: archive {} verified; would receive it{}",
+                    a.project,
+                    file.display(),
+                    if a.no_live { "" } else { " and recreate the project if its directory is gone" }
+                )
+            },
+        );
+        return Ok(());
+    }
     let mut pref = match project::resolve(ctx, &a.project) {
         Ok(p) => p,
         Err(_) => {

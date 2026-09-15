@@ -6,24 +6,32 @@ use crate::error::{BpmError, refused, usage};
 use crate::mechanics::snapshot::{self, DeleteMode};
 use crate::output::emit;
 use crate::project;
-use crate::store::Stage;
+use crate::store::{Stage, snapid};
 use anyhow::Result;
 
 pub fn run(ctx: &Ctx, a: RmArgs) -> Result<()> {
-    let (unit, record) = if a.container {
+    let (unit, record, selectors) = if a.container {
+        let selectors: Vec<String> = a.project.iter().chain(a.snapshots.iter()).cloned().collect();
+        if let Some(bad) = selectors.iter().find(|s| snapid::parse(s, &ctx.tz).is_err()) {
+            return Err(usage(format!("{bad:?} is not a snapshot selector; --container takes only snapshot ids")));
+        }
         let root = ctx.roots().into_iter().next().ok_or_else(|| usage("no root configured"))?;
         let store = ctx.store(&root);
         let unit = store.container();
         let rec = unit.read_record()?.ok_or_else(|| usage("no container store"))?;
-        (unit, rec)
+        (unit, rec, selectors)
     } else {
-        let pref = project::resolve(ctx, &a.project)?;
-        (pref.unit, pref.record)
+        let project = a.project.as_deref().ok_or_else(|| usage("name a project and snapshots"))?;
+        let pref = project::resolve(ctx, project)?;
+        (pref.unit, pref.record, a.snapshots.clone())
     };
+    if selectors.is_empty() {
+        return Err(usage("name the snapshots to delete"));
+    }
     let unit = unit.lock(ctx.cfg.global.lock_timeout)?;
     let mut snaps = unit.snapshots()?;
     let mut targets = Vec::new();
-    for sel in &a.snapshots {
+    for sel in &selectors {
         targets.push(super::select(ctx, &unit, &snaps, sel)?.clone());
     }
     let st = unit.read_state()?;
@@ -94,19 +102,20 @@ pub fn forget(ctx: &Ctx, a: ForgetArgs) -> Result<()> {
             pref.unit.dir.display()
         )));
     }
-    if !ctx.opts.dry_run {
-        // only bpm's own files: never recurse into a snapshot subvolume
-        for f in ["project.toml", "state.toml", "FROZEN", "op.journal", "lock"] {
-            let _ = std::fs::remove_file(pref.unit.dir.join(f));
+    // only bpm's own files: never recurse into a snapshot subvolume
+    for f in ["project.toml", "state.toml", "FROZEN", "op.journal", "lock"] {
+        if pref.unit.dir.join(f).exists() {
+            let _ = ctx.fs.remove_file(&pref.unit.dir.join(f));
         }
-        for e in std::fs::read_dir(&pref.unit.dir)?.flatten() {
-            if e.file_type().is_ok_and(|t| t.is_dir()) {
-                let _ = std::fs::remove_dir(e.path());
-            }
-        }
-        std::fs::remove_dir(&pref.unit.dir)
-            .map_err(|e| refused(format!("{} is not empty after forget ({e}); inspect it", pref.unit.dir.display())))?;
     }
+    for e in std::fs::read_dir(&pref.unit.dir)?.flatten() {
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = ctx.fs.remove_dir(&e.path());
+        }
+    }
+    ctx.fs
+        .remove_dir(&pref.unit.dir)
+        .map_err(|e| refused(format!("{} is not empty after forget ({e:#}); inspect it", pref.unit.dir.display())))?;
     drop(lu);
     emit(ctx, &serde_json::json!({"forgot": pref.name(), "deleted_snapshots": snaps.len()}), || {
         format!("{}: removed from the store ({} snapshots deleted)", pref.name(), snaps.len())

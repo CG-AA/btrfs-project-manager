@@ -10,7 +10,7 @@ use crate::hooks::{self, HookCtx, HookEvent};
 use crate::project::ProjectRef;
 use crate::store::journal::Journal;
 use crate::store::{LockedUnit, SnapshotKind, SnapshotMeta};
-use crate::util::fs::{lchown, rename_exchange, rename_strict, safe_relative, sibling};
+use crate::util::fs::{lchown, rename_strict, safe_relative, sibling};
 use crate::util::relpath::RelPath;
 use crate::util::{proc, walk};
 use anyhow::{Context, Result, bail};
@@ -130,7 +130,7 @@ pub fn restore_paths(
             return Err(e);
         }
         if existing.is_some() {
-            rename_exchange(&dst, &tmp)?;
+            ctx.fs.rename_exchange(&dst, &tmp)?;
             // `tmp` now holds what was replaced; it is deleted only if the pre-restore snapshot
             // has all of it (no nested subvolumes or mounts, nothing written since)
             let expect = Expect::Tree { stats: None, not_after: started, exclude: vec![] };
@@ -154,7 +154,7 @@ pub fn restore_paths(
                 Outcome::Kept(k) => report.kept.push(k),
             }
         } else {
-            rename_strict(&tmp, &dst)?;
+            ctx.fs.rename(&tmp, &dst)?;
         }
         if to.is_some() && !crate::privilege::is_root() {
             // copying out as a normal user already has the right owner
@@ -265,7 +265,7 @@ pub fn rollback(
     journal.step(3)?;
     // Move the live tree aside first and snapshot it there: a write that still lands in it
     // (a shell whose working directory is inside) is caught before it is deleted.
-    rename_strict(&live, &aside)?;
+    ctx.fs.rename(&live, &aside)?;
     let safety = {
         let mut target = Target::for_project(pref, eff);
         target.live = &aside;
@@ -314,7 +314,7 @@ pub fn rollback(
         };
         if let Ok(dmd) = std::fs::symlink_metadata(&dst) {
             if dmd.is_dir() && crate::util::fs::dir_is_empty(&dst)? {
-                std::fs::remove_dir(&dst)?;
+                ctx.fs.remove_dir(&dst)?;
             } else {
                 tracing::warn!(
                     "rollback: {} exists in the snapshot and is not an empty placeholder; nested subvolume left in {}",
@@ -329,7 +329,7 @@ pub fn rollback(
                 std::fs::create_dir_all(parent)?;
             }
         }
-        rename_strict(&aside.join(rel), &dst).with_context(|| format!("move nested subvolume {}", rel.display()))?;
+        ctx.fs.rename(&aside.join(rel), &dst).with_context(|| format!("move nested subvolume {}", rel.display()))?;
         moved.push(rel.clone());
     }
     journal.step(7)?;
@@ -365,7 +365,7 @@ pub fn rollback(
 
 fn keep_aside(ctx: &Ctx, aside: &Path, why: &str) -> Result<Option<PathBuf>> {
     let keep = retire::keep_name(ctx, aside, "rollback");
-    rename_strict(aside, &keep)?;
+    ctx.fs.rename(aside, &keep)?;
     tracing::error!(
         "rollback: kept the previous tree as {} instead of deleting it: {why}. Compare with the rollback snapshot and merge by hand, then delete it",
         keep.display()

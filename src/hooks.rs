@@ -147,9 +147,15 @@ fn dir_entries(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Hooks for `event` and whether they would run. Global hooks must be owned by the user bpm runs
+/// as: root for the tick and every mutating command (so `bpm hooks list` checks against root
+/// whoever asks), the invoking user only when bpm itself runs unprivileged.
 pub fn list(ctx: &Ctx, event: HookEvent, h: &HookCtx) -> Vec<HookListing> {
+    list_for(ctx, event, h, 0)
+}
+
+fn list_for(ctx: &Ctx, event: HookEvent, h: &HookCtx, root_uid: u32) -> Vec<HookListing> {
     let mut out = Vec::new();
-    let root_uid = if privilege::is_root() { 0 } else { unsafe { libc::geteuid() } };
     for path in dir_entries(&ctx.cfg.global.hooks_dir.join(event.as_str())) {
         let res = check_file(&path, root_uid);
         out.push(HookListing {
@@ -288,7 +294,8 @@ pub fn run(ctx: &Ctx, event: HookEvent, h: &HookCtx) -> Result<()> {
     if ctx.opts.no_hooks {
         return Ok(());
     }
-    for l in list(ctx, event, h) {
+    let runner = unsafe { libc::geteuid() };
+    for l in list_for(ctx, event, h, runner) {
         if !l.will_run {
             if l.scope == "global" || ctx.cfg.global.project_hooks != "off" {
                 tracing::warn!("hook {} skipped: {}", l.path.display(), l.skip_reason.clone().unwrap_or_default());

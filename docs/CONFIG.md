@@ -136,4 +136,7 @@ dormant_after = "30d"
 ```
 
 An agent working in the repository can edit this file, so it cannot change hooks or sudo
-behaviour. Set `global.project_config = false` to ignore these files entirely.
+behaviour, and its `[policy.shrink_guard]` and `[policy.thin]` tables are ignored (with a warning):
+whether deletions freeze cleanup and how long history is kept are set in the admin config, for
+example `[projects."name".policy.thin]`. Set `global.project_config = false` to ignore these files
+entirely.

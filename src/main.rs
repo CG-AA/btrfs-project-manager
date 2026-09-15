@@ -3,7 +3,7 @@ use bpm::btrfs::{Btrfs, DryRunBtrfs, real::RealBtrfs};
 use bpm::cli::{Cli, Cmd};
 use bpm::clock::SystemClock;
 use bpm::ctx::{Ctx, Invoker, Opts};
-use bpm::util::fs::ReflinkMode;
+use bpm::util::fs::{DryRunFs, Fs, RealFs, ReflinkMode};
 use bpm::{config, error, ops, output, privilege};
 use clap::{CommandFactory, Parser};
 use std::sync::Arc;
@@ -25,11 +25,13 @@ fn run(cli: Cli) -> Result<()> {
     )?;
     let real: Arc<dyn Btrfs> = Arc::new(RealBtrfs::default());
     let btrfs: Arc<dyn Btrfs> = if cli.global.dry_run { Arc::new(DryRunBtrfs(real)) } else { real };
+    let fs: Arc<dyn Fs> = if cli.global.dry_run { Arc::new(DryRunFs) } else { Arc::new(RealFs) };
     let g = cli.global;
     let ctx = Ctx {
         cfg: loaded.config,
         cfg_path: loaded.path,
         btrfs,
+        fs,
         clock: Arc::new(SystemClock),
         tz: jiff::tz::TimeZone::system(),
         opts: Opts {

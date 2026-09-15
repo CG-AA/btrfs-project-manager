@@ -646,3 +646,153 @@ fn foreign_subvolume_is_auto_adopted() {
     assert!(env.unit("newproj").read_record().unwrap().is_some());
     assert!(!env.snaps("newproj").is_empty());
 }
+
+// ---------------- CLI, config and docs ----------------
+
+/// `doctor --fix --dry-run` must not delete or rename leftovers.
+#[test]
+fn doctor_fix_dry_run_changes_nothing() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    write_files(&env.p("demo.bpm-old/src"), 2, "only-here");
+    let mut ctx = env.ctx();
+    ctx.opts.dry_run = true;
+    ctx.btrfs = std::sync::Arc::new(bpm::btrfs::DryRunBtrfs(env.fake.clone()));
+    ctx.fs = std::sync::Arc::new(bpm::util::fs::DryRunFs);
+    let cli = <bpm::cli::Cli as clap::Parser>::try_parse_from(["bpm", "doctor", "--fix"]).unwrap();
+    bpm::ops::dispatch(&ctx, cli.cmd).unwrap();
+    assert!(env.p("demo.bpm-old/src/only-here0.txt").exists());
+}
+
+/// `rm --container 5 6` means two container snapshots; a project name is refused.
+#[test]
+fn rm_container_takes_only_snapshot_ids() {
+    let env = Env::new("");
+    fs::write(env.p("loose.txt"), "x").unwrap();
+    env.run(&["snap", "--container"]).unwrap();
+    fs::write(env.p("loose.txt"), "y").unwrap();
+    env.run(&["snap", "--container"]).unwrap();
+    let ids: Vec<String> = env.store().container().snapshots().unwrap().iter().map(|m| m.id.to_string()).collect();
+    assert_eq!(ids.len(), 2);
+    let err = env.run(&["rm", "myproj", &ids[0], "--container"]).unwrap_err();
+    assert_eq!(bpm::error::exit_code_for(&err), 2, "{err:#}");
+    env.run(&["rm", "--container", &ids[0], &ids[1]]).unwrap();
+    assert!(env.store().container().snapshots().unwrap().is_empty());
+}
+
+/// `bpm --dry-run wrap -- cmd` neither snapshots nor runs the command.
+#[test]
+fn wrap_dry_run_runs_nothing() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    let mut ctx = env.ctx();
+    ctx.opts.dry_run = true;
+    let marker = env.base.join("ran");
+    let cli = <bpm::cli::Cli as clap::Parser>::try_parse_from([
+        "bpm",
+        "wrap",
+        "--project",
+        "demo",
+        "--",
+        "touch",
+        marker.to_str().unwrap(),
+    ])
+    .unwrap();
+    bpm::ops::dispatch(&ctx, cli.cmd).unwrap();
+    assert!(!marker.exists());
+    assert_eq!(env.snaps("demo").len(), 1);
+}
+
+/// Restoring paths into a project whose directory is gone refuses instead of creating a stub.
+#[test]
+fn restore_paths_into_missing_project_refuses() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::remove_dir_all(env.p("demo")).unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    let err = env.run(&["restore", "demo", "latest", "src/src1.txt"]).unwrap_err();
+    assert!(format!("{err:#}").contains("--recreate"), "{err:#}");
+    assert!(!env.p("demo").exists(), "no stub directory");
+    env.run(&["restore", "demo", "--recreate"]).unwrap();
+    assert!(env.p("demo/src/src1.txt").exists());
+}
+
+/// An archive made from a received snapshot can be unarchived again.
+#[test]
+fn archive_of_received_snapshot_roundtrips() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    env.run(&["archive", "demo", "--level", "3", "--delete-live", "--delete-snapshots", "--yes"]).unwrap();
+    env.run(&["unarchive", "demo", "--no-live"]).unwrap();
+    let received = env.snaps("demo").iter().find(|m| m.kind == SnapshotKind::Received).unwrap().id.to_string();
+    env.advance(5);
+    env.run(&["archive", "demo", "--snapshot", &received, "--level", "3"]).unwrap();
+    let newest = fs::read_dir(env.base.join("archives/demo"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".btrfs.zst"))
+        .max_by_key(|p| fs::metadata(p).unwrap().modified().unwrap())
+        .unwrap();
+    env.run(&["unarchive", "demo", newest.to_str().unwrap()]).unwrap();
+    assert!(env.p("demo/src/src7.txt").exists());
+}
+
+/// A manifest cannot place the project outside the root.
+#[test]
+fn unarchive_refuses_manifest_path_escape() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    env.run(&["archive", "demo", "--level", "3"]).unwrap();
+    let zst = fs::read_dir(env.base.join("archives/demo"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.to_string_lossy().ends_with(".btrfs.zst"))
+        .unwrap();
+    let mpath = bpm::mechanics::archive::manifest_path(&zst);
+    let m = fs::read_to_string(&mpath).unwrap().replace("project = \"demo\"", "project = \"../escape\"");
+    fs::write(&mpath, m).unwrap();
+    assert!(env.run(&["unarchive", "pwn", zst.to_str().unwrap()]).is_err());
+    assert!(!env.base.join("escape").exists());
+}
+
+/// `.bpm.toml` cannot switch off the shrink guard or empty the retention windows.
+#[test]
+fn project_file_cannot_disable_guard_or_retention() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    for i in 0..5 {
+        fs::write(env.p(&format!("demo/src/src{i}.txt")), format!("changed {i} {}", "more content ".repeat(40)))
+            .unwrap();
+        env.advance(900);
+        env.run(&["tick"]).unwrap();
+    }
+    let before = env.snaps("demo").len();
+    fs::write(
+        env.p("demo/.bpm.toml"),
+        "[policy.shrink_guard]\nenabled=false\n[policy.thin]\nkeep_all=\"0s\"\nhourly=\"0s\"\ndaily=\"0s\"\nweekly=\"0s\"\nsafety_ttl=\"0s\"\n",
+    )
+    .unwrap();
+    for i in 0..40 {
+        let _ = fs::remove_file(env.p(&format!("demo/src/src{i}.txt")));
+    }
+    env.advance(900);
+    env.run(&["tick"]).unwrap();
+    assert!(env.state("demo").frozen.is_some());
+    assert!(env.snaps("demo").len() > before, "{}", describe(&env, "demo"));
+}
+
+/// `bpm setup --print-claude-hook` only prints and needs no root.
+#[test]
+fn print_claude_hook_needs_no_root() {
+    let cli = <bpm::cli::Cli as clap::Parser>::try_parse_from(["bpm", "setup", "--print-claude-hook"]).unwrap();
+    assert!(!cli.cmd.needs_root());
+}

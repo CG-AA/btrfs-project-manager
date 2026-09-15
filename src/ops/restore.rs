@@ -22,6 +22,14 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
         }
         let new_uuid = rollback::recreate(ctx, &lu, &mut pref, &meta)?;
         if ctx.opts.dry_run {
+            emit(ctx, &serde_json::json!({"dry_run": true, "project": pref.name(), "recreate_from": meta.id}), || {
+                format!(
+                    "[dry-run] {}: would recreate {} from snapshot #{}",
+                    pref.name(),
+                    pref.path().display(),
+                    meta.id
+                )
+            });
             return Ok(());
         }
         let eff = super::effective(ctx, &pref)?;
@@ -50,6 +58,13 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
     }
     if a.paths.is_empty() {
         return Err(usage("name the paths to restore, or pass --recreate for the whole project"));
+    }
+    if a.to.is_none() && !ctx.btrfs.subvol_info(pref.path()).is_ok_and(|i| i.uuid == pref.record.uuid) {
+        return Err(refused(format!(
+            "{} is not the live project; recreate it with `bpm restore {} --recreate`, or copy out with --to DIR",
+            pref.path().display(),
+            pref.name()
+        )));
     }
     let eff = super::effective(ctx, &pref)?;
     let report = rollback::restore_paths(ctx, &pref, &eff, &meta, &a.paths, a.to.as_deref(), a.overwrite)?;
@@ -98,6 +113,9 @@ pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<()> {
     }
     let report = rollback::rollback(ctx, &lu, &mut pref, &eff, &meta, a.drop_build_dirs, a.force)?;
     if ctx.opts.dry_run {
+        emit(ctx, &serde_json::json!({"dry_run": true, "project": pref.name(), "rollback_to": meta.id}), || {
+            format!("[dry-run] {}: would roll back to snapshot #{}", pref.name(), meta.id)
+        });
         return Ok(());
     }
     let mut st = pref.unit.read_state()?;

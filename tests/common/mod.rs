@@ -74,6 +74,7 @@ min_bytes = "1K"
             cfg: loaded.config,
             cfg_path: loaded.path,
             btrfs: self.fake.clone(),
+            fs: Arc::new(bpm::util::fs::RealFs),
             clock: self.clock.clone(),
             tz: jiff::tz::TimeZone::UTC,
             opts: Opts { quiet: true, no_sudo: true, config: Some(cfg_path), ..Default::default() },

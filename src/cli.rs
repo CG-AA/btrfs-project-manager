@@ -120,6 +120,7 @@ impl Cmd {
             Cmd::Doctor(a) => a.fix,
             Cmd::Hooks { cmd } => matches!(cmd, HooksCmd::Run(_)),
             Cmd::Snap(a) => !a.claude_hook,
+            Cmd::Setup(a) => !a.print_claude_hook,
             _ => true,
         }
     }
@@ -302,11 +303,13 @@ pub struct RollbackArgs {
 
 #[derive(Args, Debug)]
 pub struct RmArgs {
-    pub project: String,
-    #[arg(required = true)]
+    /// Project name or path (with --container: the first snapshot)
+    pub project: Option<String>,
+    /// Snapshot selectors
     pub snapshots: Vec<String>,
     #[arg(long)]
     pub force_held: bool,
+    /// Delete snapshots of the root container; every argument is a snapshot
     #[arg(long)]
     pub container: bool,
 }

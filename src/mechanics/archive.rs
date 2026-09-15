@@ -26,6 +26,10 @@ pub struct Manifest {
     pub original_path: PathBuf,
     pub snapshot_id: u64,
     pub snapshot_uuid: Uuid,
+    /// The uuid `btrfs send` writes into the stream: the snapshot's own uuid, or the uuid it was
+    /// received from when the archived snapshot was itself received.
+    #[serde(default)]
+    pub stream_uuid: Option<Uuid>,
     pub snapshot_otransid: u64,
     pub snapshot_created: Timestamp,
     #[serde(default)]
@@ -146,6 +150,7 @@ pub fn archive(
         original_path: pref.record.path.clone(),
         snapshot_id: meta.id,
         snapshot_uuid: meta.snapshot_uuid,
+        stream_uuid: Some(meta.received_uuid.unwrap_or(meta.snapshot_uuid)),
         snapshot_otransid: meta.snapshot_otransid,
         snapshot_created: meta.created,
         stats: meta.stats.clone(),
@@ -184,12 +189,17 @@ pub fn newest_archive(dest_root: &Path, project: &str) -> Result<PathBuf> {
     files.pop().ok_or_else(|| not_found(format!("no archives in {}", dir.display())))
 }
 
-/// Receive an archive into the project's store unit as a held `received` snapshot.
-pub fn receive(ctx: &Ctx, pref: &ProjectRef, archive: &Path, manifest: &Manifest) -> Result<SnapshotMeta> {
+pub fn verify(archive: &Path, manifest: &Manifest) -> Result<()> {
     let sha = sha256_file(archive)?;
     if sha != manifest.sha256 {
         bail!("sha256 mismatch for {}: manifest {}, file {sha}", archive.display(), manifest.sha256);
     }
+    Ok(())
+}
+
+/// Receive an archive into the project's store unit as a held `received` snapshot.
+pub fn receive(ctx: &Ctx, pref: &ProjectRef, archive: &Path, manifest: &Manifest) -> Result<SnapshotMeta> {
+    verify(archive, manifest)?;
     let unit = &pref.unit;
     unit.ensure_dir()?;
     let id = unit.next_id()?;
@@ -221,10 +231,11 @@ pub fn receive(ctx: &Ctx, pref: &ProjectRef, archive: &Path, manifest: &Manifest
         return Err(e);
     }
     let info = ctx.btrfs.subvol_info(&snap_path)?;
-    if info.received_uuid != Some(manifest.snapshot_uuid) {
+    let expected = manifest.stream_uuid.unwrap_or(manifest.snapshot_uuid);
+    if info.received_uuid != Some(expected) && info.received_uuid != Some(manifest.snapshot_uuid) {
         let _ = ctx.btrfs.delete_subvolume(&snap_path, false);
         let _ = std::fs::remove_dir_all(&tmp);
-        bail!("received subvolume has received_uuid {:?}, expected {}", info.received_uuid, manifest.snapshot_uuid);
+        bail!("received subvolume has received_uuid {:?}, expected {expected}", info.received_uuid);
     }
     let meta = SnapshotMeta {
         format: 1,

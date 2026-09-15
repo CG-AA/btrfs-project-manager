@@ -9,9 +9,8 @@ use crate::btrfs::SubvolInfo;
 use crate::ctx::Ctx;
 use crate::policy::change;
 use crate::store::SnapshotMeta;
-use crate::util::fs::rename_strict;
 use crate::util::{proc, walk};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use jiff::Timestamp;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -155,17 +154,9 @@ pub fn delete(ctx: &Ctx, proof: Proof) -> Result<()> {
                 ctx.btrfs.delete_subvolume(&n, true)?;
             }
         }
-        if ctx.opts.dry_run {
-            tracing::info!("[dry-run] remove {}", proof.path.display());
-            return Ok(());
-        }
-        std::fs::remove_dir_all(&proof.path).with_context(|| format!("remove {}", proof.path.display()))
+        ctx.fs.remove_dir_all(&proof.path)
     } else {
-        if ctx.opts.dry_run {
-            tracing::info!("[dry-run] remove {}", proof.path.display());
-            return Ok(());
-        }
-        std::fs::remove_file(&proof.path).with_context(|| format!("remove {}", proof.path.display()))
+        ctx.fs.remove_file(&proof.path)
     }
 }
 
@@ -192,9 +183,7 @@ pub fn retire(ctx: &Ctx, path: &Path, expect: &Expect, allowed_nested: &[PathBuf
         }
         Err(why) => {
             let keep = keep_name(ctx, path, op);
-            if !ctx.opts.dry_run {
-                rename_strict(path, &keep)?;
-            }
+            ctx.fs.rename(path, &keep)?;
             tracing::error!(
                 "{op}: kept {} instead of deleting it: {why}. It may hold changes that exist nowhere else; compare and merge by hand, then delete it",
                 keep.display()
