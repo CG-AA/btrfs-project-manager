@@ -272,6 +272,12 @@ pub fn findings(ctx: &Ctx, fix: bool) -> Vec<Finding> {
             if let Ok(eff) = project::effective(ctx, &root, &f.name, &f.path) {
                 check_nested_leftovers(&mut d, &f.path, &eff.banlist);
                 check_kept_leftovers(&mut d, &f.path, &eff.banlist_paths());
+                if !eff.policy.snapshot.stats {
+                    d.warn(
+                        format!("{}: snapshot.stats = false, so the shrink guard cannot see deletions", f.name),
+                        Some("set snapshot.stats = true to have wipes freeze cleanup".into()),
+                    );
+                }
                 for rel in st.pending_convert.keys() {
                     d.info(format!(
                         "{}: banned directory {rel} is a plain directory (included in snapshots until converted)",

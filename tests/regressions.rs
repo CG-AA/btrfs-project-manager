@@ -927,3 +927,53 @@ fn restore_overwrite_keeps_modified_file_and_doctor_reports_it() {
         "doctor must report the kept file anywhere in the tree:\n{report}"
     );
 }
+
+// ---------------- counting off does not block retention ----------------
+
+/// `snapshot.stats = false` turns counting, and so the shrink guard, off. Retention waits for the
+/// guard to see the newest snapshot, which can then never happen: it must not wait for ever, or
+/// the store grows without bound for anyone who takes the documented opt-out.
+#[test]
+fn stats_disabled_still_thins() {
+    // ten minutes between snapshots, so there are several per hour to thin down to one
+    let run = |extra: &str| {
+        let env = Env::new(extra);
+        make_rust_project(&env, "demo");
+        env.advance(10);
+        env.run(&["adopt", "demo"]).unwrap();
+        for i in 0..36 {
+            fs::write(env.p(&format!("demo/src/src{}.txt", i % 40)), format!("edit {i:03}")).unwrap();
+            env.advance(600);
+            env.run(&["tick"]).unwrap();
+        }
+        let snaps = env.snaps("demo");
+        (snaps.len(), snaps.iter().filter(|m| m.stats.is_some()).count(), describe(&env, "demo"))
+    };
+    let thin = "[defaults.thin]\nkeep_all = \"1h\"\n";
+    let (counted, _, _) = run(thin);
+    let (uncounted, with_stats, desc) = run(&format!("{thin}[defaults.snapshot]\nstats = false\n"));
+    // adopt counts its own snapshot; the tick must not count any of the later ones
+    assert_eq!(with_stats, 1, "counting is off: {desc}");
+    assert!(counted < 25, "the counted run did not thin either: {counted} kept");
+    assert!(uncounted <= counted + 2, "retention is blocked with counting off: {uncounted} vs {counted}\n{desc}");
+}
+
+/// The wait is still real when counting is only throttled: a snapshot the guard has not seen yet
+/// must hold retention back, so a wipe cannot be thinned away before it is checked.
+#[test]
+fn throttled_stats_still_block_thinning() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    env.run(&["adopt", "demo"]).unwrap();
+    let unit = env.unit("demo").lock(Duration::ZERO).unwrap();
+    let mut m = env.snaps("demo")[0].clone();
+    let id = m.id;
+    m.stats = None;
+    unit.update_meta(&m).unwrap();
+    let mut st = unit.read_state().unwrap();
+    st.guard_seen = 0;
+    unit.write_state(&st).unwrap();
+    drop(unit);
+    assert!(!bpm::mechanics::observe::thin_allowed(&env.state("demo"), &env.snaps("demo")), "snapshot #{id} unseen");
+}

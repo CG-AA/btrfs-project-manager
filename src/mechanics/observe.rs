@@ -166,6 +166,12 @@ pub fn evaluate_guard(
             Walk::Always => true,
         };
         if !go {
+            // With counting off by policy the guard can never see this snapshot, so waiting for
+            // it would block retention and collapse for ever. Nothing is being protected here:
+            // record it as seen and let cleanup proceed.
+            if !eff.policy.snapshot.stats {
+                mark_evaluated(st, &n);
+            }
             return false;
         }
         if let Err(e) = count_stats(ctx, lu, t, &mut n, eff.policy.snapshot.stats_budget) {
