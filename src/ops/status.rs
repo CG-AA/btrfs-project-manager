@@ -22,6 +22,7 @@ struct ProjectRow {
     newest: Option<u64>,
     newest_age: Option<String>,
     frozen: Option<Vec<String>>,
+    frozen_ref: Option<u64>,
     flags: Vec<String>,
     exclusive_bytes: Option<u64>,
 }
@@ -86,6 +87,7 @@ pub fn run(ctx: &Ctx, a: StatusArgs) -> Result<()> {
                 newest: n.map(|m| m.id),
                 newest_age: n.map(|m| fmt_age(age(now, m.created))),
                 frozen: st.frozen.as_ref().map(|f| f.reasons.clone()),
+                frozen_ref: st.frozen.as_ref().and_then(|f| f.ref_snap),
                 flags,
                 exclusive_bytes: exclusive,
             });
@@ -145,8 +147,9 @@ pub fn run(ctx: &Ctx, a: StatusArgs) -> Result<()> {
                 out.push_str(&t.render());
             }
             for p in r.projects.iter().filter(|p| p.frozen.is_some()) {
+                let good = p.frozen_ref.map(|id| id.to_string()).unwrap_or_else(|| "held".into());
                 out.push_str(&format!(
-                    "\n{} is FROZEN: {}\n  inspect: bpm list {0}; bpm diff {0} held\n  resolve: bpm rollback {0} held   or   bpm unfreeze {0}\n",
+                    "\n{} is FROZEN: {}\n  inspect: bpm list {0}; bpm diff {0} {good}\n  resolve: bpm rollback {0} {good}   or   bpm unfreeze {0}\n",
                     p.name,
                     p.frozen.as_ref().unwrap().join("; ")
                 ));

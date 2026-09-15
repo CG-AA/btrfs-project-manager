@@ -167,6 +167,17 @@ pub fn take(ctx: &Ctx, t: &Target, o: &SnapOpts) -> Result<SnapshotMeta> {
     Ok(meta)
 }
 
+/// Count files and bytes of an existing (read-only) snapshot and store them in its metadata.
+/// Used for snapshots taken without stats, so the shrink guard can still evaluate them.
+pub fn count_stats(ctx: &Ctx, t: &Target, meta: &mut SnapshotMeta, budget: Duration) -> Result<()> {
+    let path = t.unit.snapshot_path(meta.id);
+    let probe = |p: &std::path::Path, ino: u64| ctx.is_subvol(p, ino);
+    let stats = walk::tree_stats(&path, &probe, &t.stats_exclude, &t.sentinels, budget)
+        .with_context(|| format!("count snapshot #{}", meta.id))?;
+    meta.stats = Some(stats);
+    t.unit.update_meta(meta)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeleteMode {
     /// Retention or collapse: never held, never newest, never keep-class.

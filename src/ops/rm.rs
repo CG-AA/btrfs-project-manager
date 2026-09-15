@@ -24,7 +24,7 @@ pub fn run(ctx: &Ctx, a: RmArgs) -> Result<()> {
     let mut snaps = unit.snapshots()?;
     let mut targets = Vec::new();
     for sel in &a.snapshots {
-        targets.push(super::select(ctx, &snaps, sel)?.clone());
+        targets.push(super::select(ctx, &unit, &snaps, sel)?.clone());
     }
     let st = unit.read_state()?;
     let mut deleted = Vec::new();

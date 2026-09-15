@@ -2,16 +2,14 @@
 
 use super::Target;
 use super::snapshot::{self, SnapOpts};
-use crate::config::{EffectiveConfig, RootCfg};
+use crate::config::RootCfg;
 use crate::ctx::Ctx;
 use crate::error::refused;
 use crate::hooks::{self, HookCtx, HookEvent};
-use crate::policy::{lifecycle, shrink};
 use crate::project::{self, ProjectRef};
 use crate::store::journal::Journal;
 use crate::store::{ProjectRecord, ProjectState, SnapshotKind, Store};
 use crate::util::fs::{copy_owner_mode, cp_a, rename_exchange, sibling};
-use crate::util::time::age;
 use crate::util::{proc, walk};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -295,7 +293,8 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
     let mut opts = SnapOpts::new(SnapshotKind::Adopt, if is_sub { "registered existing subvolume" } else { "adopted" });
     opts.stats_budget = eff.policy.snapshot.stats_budget;
     let meta = snapshot::take(ctx, &target, &opts)?;
-    init_state(ctx, &mut st, &eff, &record, &meta, &path)?;
+    let last_change = meta.stats.as_ref().and_then(|s| s.newest_mtime).unwrap_or(ctx.now());
+    super::observe::init_new_live(ctx, &eff, &mut st, &meta, &path, last_change)?;
     unit.write_state(&st)?;
 
     journal.step(7)?;
@@ -327,31 +326,4 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
         snapshot: meta.id,
         stage: st.stage.to_string(),
     })
-}
-
-/// Fresh state after adoption or project recreation.
-pub fn init_state(
-    ctx: &Ctx,
-    st: &mut ProjectState,
-    eff: &EffectiveConfig,
-    record: &ProjectRecord,
-    meta: &crate::store::SnapshotMeta,
-    live: &Path,
-) -> Result<()> {
-    let now = ctx.now();
-    ctx.btrfs.sync(live)?;
-    let info = ctx.btrfs.subvol_info(live)?;
-    st.snap_ctransid = meta.source_ctransid;
-    st.tool_ctransid = info.ctransid;
-    st.last_snapshot_at = Some(meta.created);
-    if let Some(s) = meta.complete_stats() {
-        st.ref_stats = Some(shrink::reset(s, meta.id));
-        st.last_stats_at = Some(meta.created);
-    }
-    let last_change = meta.stats.as_ref().and_then(|s| s.newest_mtime).map(|t| t.min(now)).unwrap_or(now);
-    st.last_change_at = Some(last_change);
-    let stage = lifecycle::stage_for_idle(age(now, last_change), &eff.policy.lifecycle);
-    st.stage = stage;
-    st.stage_since = Some(record.adopted);
-    Ok(())
 }

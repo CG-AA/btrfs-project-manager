@@ -1,6 +1,7 @@
 //! Collapse a project to a single snapshot, and recompress its live tree at a higher zstd level.
 
 use super::Target;
+use super::observe::{self, Walk};
 use super::snapshot::{self, DeleteMode, SnapOpts};
 use crate::btrfs::DefragOpts;
 use crate::config::EffectiveConfig;
@@ -36,23 +37,43 @@ pub fn collapse(
         return Ok(report);
     }
     let target = Target::for_project(pref, eff);
+    let now = ctx.now();
+    ctx.btrfs.sync(pref.path())?;
     let live = ctx.btrfs.subvol_info(pref.path())?;
-    let needs_fresh = newest(snaps).is_none_or(|n| !change::identical(&live, n) || n.complete_stats().is_none());
-    if needs_fresh {
-        let mut o = SnapOpts::new(SnapshotKind::Collapse, "collapse");
-        o.stats_budget = eff.policy.snapshot.stats_budget;
-        let m = snapshot::take(ctx, &target, &o)?;
-        st.snap_ctransid = m.source_ctransid;
-        st.last_snapshot_at = Some(m.created);
-        report.new_snapshot = Some(m.id);
-        snaps.push(m.clone());
-        if super::guard::apply(ctx, &target, eff, st, snaps, &m) {
-            report.froze = true;
-            return Ok(report);
+    observe::note_live(st, &live, now);
+    match newest(snaps).cloned() {
+        Some(n) if change::identical(&live, &n) => {
+            // the newest snapshot already holds this state: count it if it was taken without stats
+            if n.stats.is_none() {
+                let mut n = n;
+                snapshot::count_stats(ctx, &target, &mut n, eff.policy.snapshot.stats_budget)?;
+                if let Some(slot) = snaps.iter_mut().find(|m| m.id == n.id) {
+                    *slot = n;
+                }
+            }
+        }
+        _ => {
+            let mut o = SnapOpts::new(SnapshotKind::Collapse, "collapse");
+            o.stats_budget = eff.policy.snapshot.stats_budget;
+            let m = snapshot::take(ctx, &target, &o)?;
+            observe::note_snapshot(st, &m);
+            report.new_snapshot = Some(m.id);
+            snaps.push(m);
         }
     }
+    if observe::evaluate_guard(ctx, &target, eff, st, snaps, now, Walk::Never) {
+        report.froze = true;
+        return Ok(report);
+    }
     if newest(snaps).is_none_or(|n| n.complete_stats().is_none()) {
-        tracing::warn!("{}: newest snapshot has incomplete stats; not collapsing", pref.name());
+        tracing::warn!(
+            "{}: counting the newest snapshot exceeded snapshot.stats_budget; not collapsing until the project changes",
+            pref.name()
+        );
+        st.collapse_incomplete_ctransid = Some(live.ctransid);
+        return Ok(report);
+    }
+    if !observe::thin_allowed(st, snaps) {
         return Ok(report);
     }
     let ids = thin::collapse_deletions(snaps, ctx.now(), eff.policy.thin.safety_ttl, st.frozen.as_ref());
@@ -238,11 +259,10 @@ pub fn recompress(
     let mut o = SnapOpts::new(SnapshotKind::Collapse, format!("recompress zstd:{level}"));
     o.stats_budget = eff.policy.snapshot.stats_budget;
     let m = snapshot::take(ctx, &target, &o)?;
-    st.snap_ctransid = m.source_ctransid;
-    st.last_snapshot_at = Some(m.created);
+    observe::note_snapshot(st, &m);
     report.new_snapshot = Some(m.id);
     snaps.push(m.clone());
-    if super::guard::apply(ctx, &target, eff, st, snaps, &m) {
+    if observe::evaluate_guard(ctx, &target, eff, st, snaps, ctx.now(), Walk::Never) {
         journal.finish()?;
         skip(&mut report, "shrink guard froze the project after defragment".into());
         return Ok(report);
@@ -272,7 +292,7 @@ pub fn recompress(
     }
     ctx.btrfs.sync(&live)?;
     let after = ctx.btrfs.subvol_info(&live)?;
-    st.tool_ctransid = after.ctransid;
+    observe::note_tool_change(st, &live_info, &after, ctx.now());
     report.free_after = ctx.free_bytes(&live)?;
     st.recompress = Some(RecompressRecord {
         at: ctx.now(),

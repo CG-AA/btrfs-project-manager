@@ -5,6 +5,7 @@ pub mod adopt;
 pub mod archive;
 pub mod banlist;
 pub mod guard;
+pub mod observe;
 pub mod recompress;
 pub mod rollback;
 pub mod snapshot;

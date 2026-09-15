@@ -75,7 +75,7 @@ Set these under `[defaults]`, `[profiles.X.policy]`, `[root.policy]`, `[projects
 | `snapshot.min_interval` | `"5m"` | minimum spacing of automatic snapshots |
 | `snapshot.stats` | `true` | count files and bytes in new snapshots (needed by the shrink guard) |
 | `snapshot.stats_budget` | `"120s"` | give up counting after this (incomplete stats block collapse and recompress) |
-| `snapshot.stats_min_interval` | `"30m"` | for trees whose count takes over 2 s, count at most this often |
+| `snapshot.stats_min_interval` | `"30m"` | for trees whose count takes over 2 s, count at most this often; a snapshot taken without a count is counted later, and retention waits for that |
 | `thin.keep_all` | `"6h"` | keep every automatic snapshot younger than this |
 | `thin.hourly` | `"48h"` | then the oldest snapshot of each hour |
 | `thin.daily` | `"14d"` | then of each day |

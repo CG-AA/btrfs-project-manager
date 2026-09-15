@@ -4,6 +4,7 @@ use crate::cli::SnapArgs;
 use crate::ctx::Ctx;
 use crate::error::usage;
 use crate::mechanics::Target;
+use crate::mechanics::observe;
 use crate::mechanics::snapshot::{self, SnapOpts};
 use crate::output::emit;
 use crate::policy::change;
@@ -144,14 +145,11 @@ pub fn snap_project(ctx: &Ctx, pref: &ProjectRef, a: &SnapArgs, kind: SnapshotKi
     o.hold = a.hold;
     o.pair = a.pair;
     let meta = snapshot::take(ctx, &target, &o)?;
-    st.snap_ctransid = meta.source_ctransid;
-    st.last_snapshot_at = Some(meta.created);
-    if meta.stats.is_some() {
-        st.last_stats_at = Some(meta.created);
-    }
+    // Without the lock the tick owns the state; it counts and checks this snapshot next time.
     if lock.is_some() {
+        observe::note_snapshot(&mut st, &meta);
         snaps.push(meta.clone());
-        crate::mechanics::guard::apply(ctx, &target, &eff, &mut st, &mut snaps, &meta);
+        observe::after_command(ctx, &target, &eff, pref.record.adopted, &mut st, &mut snaps)?;
         pref.unit.write_state(&st)?;
     }
     Ok(SnapResult { project: pref.name().into(), id: Some(meta.id), kind: kind.to_string(), skipped: None })

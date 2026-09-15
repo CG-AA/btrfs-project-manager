@@ -67,8 +67,12 @@ bpm restore myproj 41 src/lost.rs       # copy it back (add --overwrite to repla
 bpm restore myproj 41 src --to /tmp/x   # or copy it somewhere else to compare
 ```
 
-**Most of a project was wiped (the shrink guard fired).** `bpm status` shows `FROZEN` and the held
-last good snapshot. Nothing from before the freeze will be deleted.
+**Most of a project was wiped (the shrink guard fired).** `bpm status` shows `FROZEN` and the id of
+the last good snapshot, which is held. Nothing from before the freeze will be deleted. The guard
+checks every snapshot, including hook snapshots taken without a file count: those are counted by
+the next tick, and retention waits until that has happened. The last good snapshot is the newest
+one that passes the check, not simply the one before the loss was noticed. `held` refers to it
+while the project is frozen.
 
 ```sh
 bpm status myproj
@@ -76,7 +80,8 @@ bpm diff myproj held                    # confirm what was lost
 bpm rollback myproj held                # replace the project with it; the wiped state is kept as a snapshot
 ```
 
-If the deletion was intentional, `bpm unfreeze myproj` accepts the current state.
+If the deletion was intentional, `bpm unfreeze myproj` accepts the current state: it snapshots and
+counts the live tree if needed and makes that the new shrink-guard reference.
 
 **The whole project directory is gone.** The next tick marks it orphaned, freezes it and holds its
 newest snapshot.

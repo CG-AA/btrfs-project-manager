@@ -5,7 +5,7 @@ use crate::ctx::Ctx;
 use crate::error::refused;
 use crate::hooks::{self, HookCtx, HookEvent};
 use crate::mechanics::snapshot::{self, DeleteMode, SnapOpts};
-use crate::mechanics::{Target, adopt, archive, banlist, rollback};
+use crate::mechanics::{Target, archive, banlist, observe, rollback};
 use crate::output::emit;
 use crate::project::{self, ProjectRef};
 use crate::store::{ProjectRecord, SnapshotKind, Stage, newest};
@@ -25,7 +25,7 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
     let mut snaps = pref.unit.snapshots()?;
     let live_exists = ctx.btrfs.subvol_info(pref.path()).map(|i| i.uuid == pref.record.uuid).unwrap_or(false);
     let meta = match &a.snapshot {
-        Some(sel) => super::select(ctx, &snaps, sel)?.clone(),
+        Some(sel) => super::select(ctx, &pref.unit, &snaps, sel)?.clone(),
         None => {
             if !live_exists {
                 return Err(refused(format!("{} does not exist; pass --snapshot", pref.path().display())));
@@ -193,11 +193,7 @@ pub fn unarchive(ctx: &Ctx, a: UnarchiveArgs) -> Result<()> {
                 &target,
                 &SnapOpts::new(SnapshotKind::Post, format!("unarchived from #{}", meta.id)),
             )?;
-            adopt::init_state(ctx, &mut st, &eff, &pref.record, &post, pref.path())?;
-            st.frozen = None;
-            st.missing_since = None;
-            st.last_change_at = Some(ctx.now());
-            st.stage = Stage::Active;
+            observe::init_new_live(ctx, &eff, &mut st, &post, pref.path(), ctx.now())?;
             recreated = true;
         }
     }

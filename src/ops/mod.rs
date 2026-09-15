@@ -24,7 +24,7 @@ use crate::config::EffectiveConfig;
 use crate::ctx::Ctx;
 use crate::error::usage;
 use crate::project::{self, ProjectRef};
-use crate::store::{SnapshotMeta, snapid};
+use crate::store::{SnapshotMeta, Unit, snapid};
 use anyhow::Result;
 use std::time::Duration;
 
@@ -75,8 +75,10 @@ pub fn effective(ctx: &Ctx, pref: &ProjectRef) -> Result<EffectiveConfig> {
     project::effective(ctx, &pref.root, pref.name(), pref.path())
 }
 
-pub fn select<'a>(ctx: &Ctx, snaps: &'a [SnapshotMeta], sel: &str) -> Result<&'a SnapshotMeta> {
-    snapid::resolve_str(sel, snaps, &ctx.tz)
+/// Resolve a snapshot selector for `unit`; `held` means the frozen project's last good snapshot.
+pub fn select<'a>(ctx: &Ctx, unit: &Unit, snaps: &'a [SnapshotMeta], sel: &str) -> Result<&'a SnapshotMeta> {
+    let frozen_ref = unit.read_state().ok().and_then(|st| st.frozen).and_then(|f| f.ref_snap);
+    snapid::resolve_str(sel, snaps, &ctx.tz, frozen_ref)
 }
 
 pub fn lock_timeout(ctx: &Ctx, explicit: Option<Duration>) -> Duration {

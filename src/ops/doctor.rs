@@ -215,7 +215,11 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
             if let Some(fr) = &st.frozen {
                 d.warn(
                     format!("{}: FROZEN: {}", f.name, fr.reasons.join("; ")),
-                    Some(format!("bpm status {0}; then bpm rollback {0} held or bpm unfreeze {0}", f.name)),
+                    Some(format!(
+                        "bpm status {0}; then bpm rollback {0} {1} or bpm unfreeze {0}",
+                        f.name,
+                        fr.ref_snap.map(|id| id.to_string()).unwrap_or_else(|| "held".into())
+                    )),
                 );
             }
             if let Some(e) = &st.last_error {

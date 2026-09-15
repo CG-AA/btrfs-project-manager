@@ -113,14 +113,27 @@ pub struct ArchiveRecord {
     pub snapshot: u64,
 }
 
+/// Mutable per-project state. The derived fields (activity, stage, snapshot bookkeeping, guard
+/// progress) are written only through `mechanics::observe`; operations report what they did
+/// there instead of updating fields themselves.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default)]
 pub struct ProjectState {
     pub stage: Stage,
     pub stage_since: Option<Timestamp>,
     pub last_change_at: Option<Timestamp>,
+    /// Pre-`seen_ctransid` state files only: fallback for the first activity check.
     pub snap_ctransid: u64,
+    /// Live `ctransid` at the last observation; anything above it (and above
+    /// `tool_ctransid`) is user activity, whichever snapshot captured it.
+    pub seen_ctransid: u64,
     pub tool_ctransid: u64,
+    /// Highest snapshot id the shrink guard has evaluated. Thinning waits while the newest
+    /// snapshot is above it.
+    pub guard_seen: u64,
+    /// Collapse found live identical to the newest snapshot but could not count it within the
+    /// stats budget at this `ctransid`; do not retry until the project changes.
+    pub collapse_incomplete_ctransid: Option<u64>,
     pub last_snapshot_at: Option<Timestamp>,
     pub last_stats_at: Option<Timestamp>,
     pub ref_stats: Option<RefStats>,

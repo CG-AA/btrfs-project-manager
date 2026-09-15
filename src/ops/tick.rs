@@ -6,13 +6,14 @@ use crate::ctx::Ctx;
 use crate::error::BpmError;
 use crate::hooks::{self, HookCtx, HookEvent};
 use crate::mechanics::banlist::{self, BanAction};
+use crate::mechanics::observe::{self, Walk};
 use crate::mechanics::snapshot::{self, DeleteMode, SnapOpts};
-use crate::mechanics::{Target, adopt, guard, recompress};
+use crate::mechanics::{Target, adopt, recompress};
 use crate::output::emit;
 use crate::policy::change::{self, SnapDecision, SnapInputs};
-use crate::policy::{lifecycle, thin};
+use crate::policy::thin;
 use crate::project::{self, Found, ProjectRef};
-use crate::store::{CONTAINER, ErrorRecord, Frozen, SnapshotKind, SnapshotMeta, Stage, Store, Unit, newest};
+use crate::store::{CONTAINER, ErrorRecord, Frozen, SnapshotKind, Stage, Store, Unit, newest};
 use crate::util::time::age;
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -433,23 +434,6 @@ fn container_step(ctx: &Ctx, root: &RootCfg, store: &Store) -> Result<(Option<u6
     Ok((took, deleted))
 }
 
-fn want_stats(
-    eff: &crate::config::EffectiveConfig,
-    st: &crate::store::ProjectState,
-    snaps: &[SnapshotMeta],
-    now: jiff::Timestamp,
-) -> bool {
-    if !eff.policy.snapshot.stats {
-        return false;
-    }
-    let last_walk_ms = snaps.iter().rev().find_map(|m| m.stats.as_ref().map(|s| s.walk_ms));
-    match (st.last_stats_at, last_walk_ms) {
-        (None, _) | (_, None) => true,
-        (_, Some(ms)) if ms < 2000 => true,
-        (Some(t), _) => age(now, t) >= eff.policy.snapshot.stats_min_interval,
-    }
-}
-
 fn project_step(ctx: &Ctx, pref: &ProjectRef, f: &Found, heavy: &mut Vec<Heavy>) -> Result<ProjectTick> {
     let mut pt = ProjectTick { name: f.name.clone(), ..Default::default() };
     let _lock = match pref.unit.lock(PROJECT_LOCK) {
@@ -482,37 +466,19 @@ fn project_step(ctx: &Ctx, pref: &ProjectRef, f: &Found, heavy: &mut Vec<Heavy>)
         st.set_stage(Stage::Active, now);
     }
     let mut snaps = pref.unit.snapshots()?;
-    if let Some(n) = newest(&snaps) {
-        if n.source_uuid == pref.record.uuid {
-            st.snap_ctransid = n.source_ctransid;
-        }
-    }
     let owner = (pref.record.owner_uid, pref.record.owner_gid);
+    let target = Target::for_project(pref, &eff);
+    let before = ctx.btrfs.subvol_info(pref.path())?;
+    observe::note_live(&mut st, &before, now);
+    observe::update_stage(ctx, &target, &eff, pref.record.adopted, &mut st, now);
     let active = st.stage == Stage::Active;
     pt.banlist = banlist::enforce_cheap(ctx, pref.path(), &eff, &mut st, owner, active)?;
     if pt.banlist.iter().any(BanAction::modified_live) {
         ctx.btrfs.sync(pref.path())?;
-        st.tool_ctransid = ctx.btrfs.subvol_info(pref.path())?.ctransid;
+        let after = ctx.btrfs.subvol_info(pref.path())?;
+        observe::note_tool_change(&mut st, &before, &after, now);
     }
     let live = ctx.btrfs.subvol_info(pref.path())?;
-    if change::user_changed(&live, &st) {
-        st.last_change_at = Some(live.ctime.unwrap_or(now).min(now));
-    }
-    let idle = age(now, st.last_change_at.unwrap_or(pref.record.adopted));
-    if let Some((from, to)) = st.set_stage(lifecycle::stage_for_idle(idle, &eff.policy.lifecycle), now) {
-        tracing::info!("{}: {from} -> {to}", f.name);
-        let h = HookCtx {
-            project: Some(&f.name),
-            project_path: Some(pref.path()),
-            owner: Some(owner),
-            root: Some(&pref.root.path),
-            stage: Some((from, to)),
-            reason: "idle".into(),
-            ..Default::default()
-        };
-        let _ = hooks::run(ctx, HookEvent::StageChange, &h);
-    }
-    let target = Target::for_project(pref, &eff);
     let free = ctx.free_bytes(pref.path())?;
     let decision = change::decide_auto_snapshot(&SnapInputs {
         live: &live,
@@ -525,17 +491,12 @@ fn project_step(ctx: &Ctx, pref: &ProjectRef, f: &Found, heavy: &mut Vec<Heavy>)
     match decision {
         SnapDecision::Take(reason) => {
             let mut o = SnapOpts::new(SnapshotKind::Auto, reason);
-            o.stats = want_stats(&eff, &st, &snaps, now);
+            o.stats = observe::want_stats(&eff, &st, &snaps, now);
             o.stats_budget = eff.policy.snapshot.stats_budget;
             let m = snapshot::take(ctx, &target, &o)?;
-            st.snap_ctransid = m.source_ctransid;
-            st.last_snapshot_at = Some(m.created);
-            if m.stats.is_some() {
-                st.last_stats_at = Some(m.created);
-            }
+            observe::note_snapshot(&mut st, &m);
             pt.snapshot = Some(m.id);
-            snaps.push(m.clone());
-            pt.froze = guard::apply(ctx, &target, &eff, &mut st, &mut snaps, &m);
+            snaps.push(m);
         }
         SnapDecision::Skip("low free space") => {
             if !st.warned.contains_key("low-space") {
@@ -547,10 +508,25 @@ fn project_step(ctx: &Ctx, pref: &ProjectRef, f: &Found, heavy: &mut Vec<Heavy>)
             st.warned.remove("low-space");
         }
     }
+    // every snapshot is checked, including hook snapshots and ones taken without stats
+    pt.froze = observe::evaluate_guard(ctx, &target, &eff, &mut st, &mut snaps, now, Walk::Throttled);
+    let thin_ok = observe::thin_allowed(&st, &snaps);
+    if thin_ok {
+        st.warned.remove("thin-pending");
+    } else if !st.warned.contains_key("thin-pending") {
+        tracing::info!(
+            "{}: newest snapshot not yet checked by the shrink guard; retention waits until it is counted",
+            f.name
+        );
+        st.warned.insert("thin-pending".into(), now);
+    }
     let windows = thin::Windows::from(&eff.policy.thin);
-    for id in
+    let deletions = if thin_ok {
         thin::select_deletions(&snaps, now, &windows, st.frozen.as_ref(), eff.policy.shrink_guard.thin_after_freeze)
-    {
+    } else {
+        vec![]
+    };
+    for id in deletions {
         let Some(m) = snaps.iter().find(|m| m.id == id).cloned() else {
             continue;
         };
@@ -582,7 +558,10 @@ fn project_step(ctx: &Ctx, pref: &ProjectRef, f: &Found, heavy: &mut Vec<Heavy>)
     {
         let live_now = ctx.btrfs.subvol_info(pref.path())?;
         let identical = newest(&snaps).is_some_and(|n| change::identical(&live_now, n));
-        if !recompress::collapsed(ctx, &snaps, &eff) || !identical {
+        let counted = newest(&snaps).is_some_and(|n| n.complete_stats().is_some());
+        if st.collapse_incomplete_ctransid == Some(live_now.ctransid) {
+            // counting this state already exceeded the stats budget; wait for a change
+        } else if !recompress::collapsed(ctx, &snaps, &eff) || !identical || !counted {
             heavy.push(Heavy::Collapse { name: f.name.clone() });
         } else if recompress::needs_recompress(&eff, &st, live_now.ctransid, &snaps) {
             heavy.push(Heavy::Recompress { name: f.name.clone() });
@@ -614,11 +593,14 @@ fn run_heavy(ctx: &Ctx, root: &RootCfg, store: &Store, op: &Heavy) -> Result<Str
         Heavy::Convert { name, rel } => {
             let (pref, eff) = with_project(name)?;
             let _l = pref.unit.lock(PROJECT_LOCK)?;
+            ctx.btrfs.sync(pref.path())?;
+            let before = ctx.btrfs.subvol_info(pref.path())?;
             banlist::convert(ctx, pref.path(), rel, eff.policy.keep_build_on_adopt, false)?;
             let mut st = pref.unit.read_state()?;
             st.pending_convert.remove(rel);
             ctx.btrfs.sync(pref.path())?;
-            st.tool_ctransid = ctx.btrfs.subvol_info(pref.path())?.ctransid;
+            let after = ctx.btrfs.subvol_info(pref.path())?;
+            observe::note_tool_change(&mut st, &before, &after, ctx.now());
             pref.unit.write_state(&st)?;
             Ok("converted".into())
         }
