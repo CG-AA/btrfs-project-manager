@@ -154,7 +154,7 @@ pub fn sample_gain(ctx: &Ctx, live: &Path, exclude: &[std::path::PathBuf], level
     Ok(if base == 0 { 0.0 } else { 1.0 - high as f64 / base as f64 })
 }
 
-/// What a defragment must not change about an entry: kind, size, mtime, mode.
+/// What a defragment must not change about an entry: kind, size, mtime (files), mode.
 type EntryKey = (crate::util::walk::EntryKind, u64, i128, u32);
 
 #[derive(Clone, Debug, Serialize)]
@@ -281,7 +281,12 @@ pub fn recompress(
     let listing = |id: u64| -> Result<Vec<(std::path::PathBuf, EntryKey)>> {
         Ok(crate::util::walk::tree_index(&pref.unit.snapshot_path(id), &probe)?
             .into_iter()
-            .map(|(k, v)| (k, (v.kind, v.size, v.mtime_ns, v.mode)))
+            // directory mtimes are left out: a change of entries already shows in the listing,
+            // and a nested subvolume's placeholder gets a fresh mtime in every snapshot
+            .map(|(k, v)| {
+                let mtime = if v.kind == crate::util::walk::EntryKind::Dir { 0 } else { v.mtime_ns };
+                (k, (v.kind, v.size, mtime, v.mode))
+            })
             .collect())
     };
     let untouched = listing(old.id)? == listing(m.id)?;

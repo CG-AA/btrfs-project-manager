@@ -393,3 +393,79 @@ fn e2e_wrap_and_doctor_fix() {
     let after = t.ok(&["doctor"]);
     assert!(!after.contains("interrupted"), "{after}");
 }
+
+#[test]
+#[ignore]
+fn e2e_nocow_and_cross_entry_hardlinks_adopt() {
+    let t = setup!("nocow");
+    let p = t.p("vm").display().to_string();
+    // a NOCOW directory (VM images, databases) and a hardlink between two top-level entries
+    sh(&format!(
+        "mkdir -p {p}/images {p}/bin {p}/scripts && chattr +C {p}/images && head -c 2000000 /dev/urandom > {p}/images/disk.img \
+         && echo tool > {p}/scripts/tool && ln {p}/scripts/tool {p}/bin/tool && chown -R {}:{} {p}",
+        t.uid, t.gid
+    ));
+    let sum = sh(&format!("sha256sum {p}/images/disk.img | cut -d' ' -f1")).stdout;
+    t.ok(&["adopt", "vm"]);
+    assert_eq!(ino(&t.p("vm")), 256);
+    assert_eq!(sh(&format!("sha256sum {p}/images/disk.img | cut -d' ' -f1")).stdout, sum);
+    assert_eq!(fs::read_to_string(t.p("vm/bin/tool")).unwrap(), "tool\n");
+    assert!(!t.root.join("vm.bpm-old").exists() && !t.root.join("vm.bpm-tmp").exists());
+}
+
+#[test]
+#[ignore]
+fn e2e_unflushed_append_is_not_identical() {
+    let t = setup!("flush");
+    t.make_project("demo");
+    t.ok(&["adopt", "demo"]);
+    // an append does not move ctransid until writeback; rollback must flush before comparing
+    sh(&format!("echo corrupted >> {}/src/f5.rs", t.p("demo").display()));
+    t.ok(&["rollback", "demo", "latest"]);
+    assert!(!fs::read_to_string(t.p("demo/src/f5.rs")).unwrap().contains("corrupted"));
+}
+
+#[test]
+#[ignore]
+fn e2e_readonly_snapshot_moves_between_directories() {
+    use bpm::btrfs::Btrfs;
+    let t = setup!("romove");
+    let b = bpm::btrfs::real::RealBtrfs::default();
+    sh(&format!("mkdir -p {0}/.snapshots/1 {0}/store && echo x > {0}/f", t.root.display()));
+    let snap = t.root.join(".snapshots/1/snapshot");
+    b.snapshot(&t.root, &snap, true).unwrap();
+    let before = get_subvol_info(&snap).unwrap();
+    let dst = t.root.join("store/snapshot");
+    assert!(fs::rename(&snap, &dst).is_err(), "a read-only subvolume cannot change directory");
+    // what `migrate-from-snapper --import` does
+    b.set_readonly(&snap, false).unwrap();
+    fs::rename(&snap, &dst).unwrap();
+    b.set_readonly(&dst, true).unwrap();
+    let after = get_subvol_info(&dst).unwrap();
+    assert_eq!((after.uuid, after.parent_uuid, after.ctransid), (before.uuid, before.parent_uuid, before.ctransid));
+    assert!(after.readonly());
+}
+
+#[test]
+#[ignore]
+fn e2e_project_hook_runs_as_owner_without_groups() {
+    let t = setup!("phook");
+    fs::write(&t.cfg, fs::read_to_string(&t.cfg).unwrap().replace("[global]\n", "[global]\nproject_hooks = \"on\"\n"))
+        .unwrap();
+    t.make_project("demo");
+    t.ok(&["adopt", "demo"]);
+    let dir = t.p("demo/.bpm/hooks/pre-snapshot");
+    let out = t.base.join("hook-out");
+    sh(&format!(
+        "mkdir -p {d} && printf '#!/bin/sh\\nid -u > {o}.tmp; id -G >> {o}.tmp\\n' > {d}/10-id && chmod 755 {d}/10-id \
+         && chown -R {u}:{g} {proj}/.bpm && touch {o}.tmp && chown {u}:{g} {o}.tmp",
+        d = dir.display(),
+        o = out.display(),
+        u = t.uid,
+        g = t.gid,
+        proj = t.p("demo").display()
+    ));
+    t.ok(&["snap", "demo"]);
+    let got = fs::read_to_string(format!("{}.tmp", out.display())).unwrap();
+    assert_eq!(got, format!("{}\n{}\n", t.uid, t.gid), "uid, then only the primary group");
+}
