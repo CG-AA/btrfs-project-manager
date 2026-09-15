@@ -19,7 +19,9 @@ Per-project policy is merged key by key, later layers winning:
 
 Banlists are unions: `defaults.banlist` + matched profile banlists + `root.banlist_add` +
 `projects.<name>.banlist_add` + `.bpm.toml` `banlist_add`, minus both `banlist_remove` lists.
-Entries are paths relative to the project root, like `target` or `web/node_modules`.
+Entries are paths relative to the project root, like `target` or `web/node_modules`. bpm never
+follows a symlink in the middle of an entry: if `web` is a symlink, `web/node_modules` is left
+alone (and stays in snapshots). The same applies to paths given to `bpm restore`.
 
 ## `[global]`
 

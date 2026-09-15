@@ -8,6 +8,7 @@ use crate::output::{Table, emit};
 use crate::project::{self, Leftover};
 use crate::store::journal::Journal;
 use crate::store::{SnapshotKind, SnapshotMeta, Stage, Unit};
+use crate::util::relpath::RelPath;
 use anyhow::Result;
 use serde::Serialize;
 use std::path::Path;
@@ -395,10 +396,10 @@ fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crat
     }
 }
 
-fn check_nested_leftovers(d: &mut Doc, live: &Path, banlist: &[String]) {
+fn check_nested_leftovers(d: &mut Doc, live: &Path, banlist: &[RelPath]) {
     let ctx = d.ctx;
     for rel in banlist {
-        let full = live.join(rel);
+        let Ok(full) = rel.under(live) else { continue };
         let full_sub = ctx.btrfs.is_subvolume(&full).unwrap_or(false);
         for suffix in [".bpm-tmp", ".bpm-old"] {
             let p = crate::util::fs::sibling(&full, suffix);

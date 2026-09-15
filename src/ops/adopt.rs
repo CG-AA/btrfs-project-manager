@@ -89,7 +89,7 @@ pub fn convert(ctx: &Ctx, a: ConvertArgs) -> Result<()> {
     let eff = super::effective(ctx, &pref)?;
     let rel = crate::util::fs::safe_relative(&a.path).ok_or_else(|| usage("path must be relative to the project"))?;
     let rel = rel.to_string_lossy().into_owned();
-    if !eff.banlist.contains(&rel) {
+    if !eff.is_banned(&rel) {
         tracing::warn!("{rel} is not in the banlist of {}; it will be excluded from snapshots anyway", pref.name());
     }
     let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;

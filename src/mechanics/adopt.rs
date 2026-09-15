@@ -11,6 +11,7 @@ use crate::project::{self, ProjectRef};
 use crate::store::journal::Journal;
 use crate::store::{ProjectRecord, ProjectState, SnapshotKind, Store};
 use crate::util::fs::{copy_owner_mode, cp_a, rename_exchange, sibling};
+use crate::util::relpath::RelPath;
 use crate::util::{proc, walk};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -154,7 +155,11 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
         },
     )?;
     if ctx.opts.dry_run {
-        tracing::info!("[dry-run] adopt {} (banlist: {})", path.display(), eff.banlist.join(", "));
+        tracing::info!(
+            "[dry-run] adopt {} (banlist: {})",
+            path.display(),
+            eff.banlist.iter().map(|b| b.as_str()).collect::<Vec<_>>().join(", ")
+        );
         return Ok(AdoptReport {
             name: name.into(),
             path,
@@ -185,7 +190,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
             copy_owner_mode(&md, &tmp)?;
             super::xattr::copy_xattrs(&path, &tmp)?;
             journal.step(2)?;
-            let banned_top: Vec<&str> = eff.banlist.iter().filter(|b| !b.contains('/')).map(String::as_str).collect();
+            let banned_top: Vec<&str> = eff.banlist.iter().filter(|b| b.is_top_level()).map(|b| b.as_str()).collect();
             let mut entries: Vec<_> = std::fs::read_dir(&path)?.flatten().collect();
             entries.sort_by_key(|e| e.file_name());
             for e in entries {
@@ -198,9 +203,15 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
                 }
                 cp_a(&e.path(), &tmp.join(&fname), ctx.reflink)?;
             }
-            for rel in eff.banlist.iter().filter(|b| b.contains('/')) {
-                let p = tmp.join(rel);
-                if p.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            for rel in eff.banlist.iter().filter(|b| !b.is_top_level()) {
+                // a symlinked parent was copied as a symlink: never delete through it
+                let Ok(p) = rel.under(&tmp) else {
+                    tracing::warn!(
+                        "{name}: banned path {rel} has a symlinked or non-directory parent; left in snapshots"
+                    );
+                    continue;
+                };
+                if p.symlink_metadata().is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
                     std::fs::remove_dir_all(&p)?;
                 }
             }
@@ -238,11 +249,12 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
             }
             copied = Some(b);
             journal.step(4)?;
-            let mut banned: Vec<&String> = eff.banlist.iter().collect();
-            banned.sort_by_key(|b| b.matches('/').count());
+            let mut banned: Vec<&RelPath> = eff.banlist.iter().collect();
+            banned.sort_by_key(|b| b.as_str().matches('/').count());
             for rel in banned {
-                let src = path.join(rel);
-                let dst = tmp.join(rel);
+                let (Ok(src), Ok(dst)) = (rel.under(&path), rel.under(&tmp)) else {
+                    continue;
+                };
                 let Ok(smd) = std::fs::symlink_metadata(&src) else {
                     continue;
                 };
@@ -258,7 +270,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
                     cp_a(&src, &dst, ctx.reflink)?;
                 }
                 let _ = super::xattr::copy_times(&src, &dst);
-                nested_made.push(rel.clone());
+                nested_made.push(rel.to_string());
             }
             super::xattr::copy_times(&path, &tmp)?;
             // last check before the swap: step 4 can take minutes for large build directories

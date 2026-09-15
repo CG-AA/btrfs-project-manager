@@ -201,14 +201,14 @@ fn detail(ctx: &Ctx, spec: &str) -> Result<()> {
     let live = ctx.btrfs.subvol_info(pref.path()).ok().filter(|i| i.uuid == pref.record.uuid);
     let mut banlist = BTreeMap::new();
     for b in &eff.banlist {
-        let p = pref.path().join(b);
+        let p = b.under_lexical(pref.path());
         let s = match std::fs::symlink_metadata(&p) {
             Err(_) => "absent".to_string(),
             Ok(m) if !m.is_dir() => "not a directory".into(),
             Ok(_) if ctx.btrfs.is_subvolume(&p).unwrap_or(false) => "nested subvolume (excluded)".into(),
             Ok(_) => "PLAIN DIRECTORY (included in snapshots until converted)".into(),
         };
-        banlist.insert(b.clone(), s);
+        banlist.insert(b.to_string(), s);
     }
     let mut unprotected = Vec::new();
     if live.is_some() {
@@ -216,7 +216,7 @@ fn detail(ctx: &Ctx, spec: &str) -> Result<()> {
         while let Some(Ok(e)) = it.next() {
             if crate::util::walk::entry_is_subvol(&e, &|p, i| ctx.is_subvol(p, i)) {
                 let rel = e.path().strip_prefix(pref.path()).unwrap().to_string_lossy().into_owned();
-                if !eff.banlist.contains(&rel) {
+                if !eff.is_banned(&rel) {
                     unprotected.push(rel);
                 }
                 it.skip_current_dir();

@@ -11,6 +11,7 @@ use crate::project::ProjectRef;
 use crate::store::journal::Journal;
 use crate::store::{SnapshotKind, SnapshotMeta};
 use crate::util::fs::{lchown, rename_exchange, rename_strict, safe_relative, sibling};
+use crate::util::relpath::RelPath;
 use crate::util::{proc, walk};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -53,10 +54,13 @@ pub fn restore_paths(
     let mut plan = Vec::new();
     for p in paths {
         let rel = normalize_rel(&live, p)?;
-        let src = snap.join(&rel);
+        let relpath =
+            RelPath::parse(&rel.to_string_lossy()).ok_or_else(|| refused(format!("invalid relative path {p:?}")))?;
+        // the snapshot is a copy of the project: a symlinked directory in it leads outside too
+        let src = relpath.under(&snap)?;
         let smd = std::fs::symlink_metadata(&src)
             .map_err(|_| crate::error::not_found(format!("{} is not in snapshot #{}", rel.display(), meta.id)))?;
-        if eff.banlist.iter().any(|b| rel.starts_with(b)) {
+        if eff.banlist.iter().any(|b| rel.starts_with(b.as_path())) {
             report.warnings.push(format!(
                 "{} is a banned (unsnapshotted) directory; the snapshot only has an empty placeholder",
                 rel.display()
@@ -67,7 +71,8 @@ pub fn restore_paths(
         }
         let dst = match to {
             Some(d) => d.join(rel.file_name().unwrap_or(rel.as_os_str())),
-            None => live.join(&rel),
+            // never create or replace through a symlink that leads out of the project
+            None => relpath.under(&live)?,
         };
         if dst.symlink_metadata().is_ok() && !overwrite {
             return Err(refused(format!(
@@ -293,12 +298,19 @@ pub fn rollback(
     let mut moved = Vec::new();
     let mut dropped = Vec::new();
     for rel in &nested {
-        let banned = eff.banlist.iter().any(|b| Path::new(b) == rel);
+        let banned = eff.banlist.iter().any(|b| b.as_path() == rel);
         if drop_build && banned {
             dropped.push(rel.clone());
             continue;
         }
-        let dst = live.join(rel);
+        let Some(dst) = RelPath::parse(&rel.to_string_lossy()).and_then(|r| r.under(&live).ok()) else {
+            tracing::warn!(
+                "rollback: {} is under a symlink in the snapshot; nested subvolume left in {}",
+                rel.display(),
+                aside.display()
+            );
+            continue;
+        };
         if let Ok(dmd) = std::fs::symlink_metadata(&dst) {
             if dmd.is_dir() && crate::util::fs::dir_is_empty(&dst)? {
                 std::fs::remove_dir(&dst)?;

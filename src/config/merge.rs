@@ -3,6 +3,7 @@
 use super::schema::*;
 use super::{BUILTIN_POLICY_TOML, builtin_profiles};
 use crate::util::fs::safe_relative;
+use crate::util::relpath::RelPath;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -25,9 +26,9 @@ pub struct EffectiveConfig {
     pub path: PathBuf,
     pub managed: bool,
     pub profiles: Vec<String>,
-    pub banlist: Vec<String>,
+    pub banlist: Vec<RelPath>,
     /// Banlist entries created ahead of time under `banlist_precreate = "primary"`.
-    pub primary_banlist: Vec<String>,
+    pub primary_banlist: Vec<RelPath>,
     pub sentinels: Vec<String>,
     pub policy: Policy,
     pub origins: BTreeMap<String, String>,
@@ -35,7 +36,10 @@ pub struct EffectiveConfig {
 
 impl EffectiveConfig {
     pub fn banlist_paths(&self) -> Vec<PathBuf> {
-        self.banlist.iter().map(PathBuf::from).collect()
+        self.banlist.iter().map(|b| b.as_path().to_path_buf()).collect()
+    }
+    pub fn is_banned(&self, rel: &str) -> bool {
+        self.banlist.iter().any(|b| b == rel)
     }
     /// Paths excluded from stats walks: banned dirs (even when still plain) and guard excludes.
     pub fn stats_exclude(&self) -> Vec<PathBuf> {
@@ -174,18 +178,18 @@ pub fn effective_for(
     let policy: Policy =
         toml::Value::Table(table).try_into().with_context(|| format!("project {name}: invalid policy"))?;
 
-    let norm = |s: &String| safe_relative(s).map(|p| p.to_string_lossy().into_owned());
-    let removed: Vec<String> = remove.iter().filter_map(norm).collect();
+    let norm = |s: &String| RelPath::parse(s);
+    let removed: Vec<RelPath> = remove.iter().filter_map(norm).collect();
     let mut seen = std::collections::BTreeSet::new();
-    let banlist: Vec<String> =
+    let banlist: Vec<RelPath> =
         banlist.iter().filter_map(norm).filter(|b| !removed.contains(b)).filter(|b| seen.insert(b.clone())).collect();
     let mut sentinels: Vec<String> = policy.shrink_guard.sentinels.clone();
     for s in sentinels_add.iter().filter_map(norm) {
-        if !sentinels.contains(&s) {
-            sentinels.push(s);
+        if !sentinels.iter().any(|x| s == *x) {
+            sentinels.push(s.to_string());
         }
     }
-    let primary_banlist: Vec<String> = primary.iter().filter_map(norm).filter(|p| banlist.contains(p)).collect();
+    let primary_banlist: Vec<RelPath> = primary.iter().filter_map(norm).filter(|p| banlist.contains(p)).collect();
     let managed = file.and_then(|f| f.managed).or_else(|| global_over.and_then(|o| o.managed)).unwrap_or(true);
     Ok(EffectiveConfig {
         name: name.into(),

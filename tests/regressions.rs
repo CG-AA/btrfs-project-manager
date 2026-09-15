@@ -407,3 +407,101 @@ fn recompress_keeps_old_snapshot_after_concurrent_change() {
     assert!(any_snap_has(&env, "demo", "important.txt"), "{}", describe(&env, "demo"));
     assert_eq!(env.state("demo").stage, Stage::Active);
 }
+
+// ---------------- no path resolution through symlinks ----------------
+
+fn victim_files(env: &Env, dir: &str) -> Vec<String> {
+    let mut v: Vec<String> = walkdir::WalkDir::new(env.p(dir))
+        .min_depth(1)
+        .into_iter()
+        .flatten()
+        .map(|e| e.path().strip_prefix(env.p(dir)).unwrap().display().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+/// Adopt with a banlist entry below a symlink must not delete the link target.
+#[test]
+fn adopt_banlist_entry_under_symlink_leaves_target_alone() {
+    let env = Env::new("");
+    write_files(&env.p("victim/secret"), 3, "v");
+    let before = victim_files(&env, "victim");
+    let p = env.p("proj");
+    write_files(&p.join("src"), 10, "s");
+    std::os::unix::fs::symlink("../victim", p.join("x")).unwrap();
+    fs::write(p.join(".bpm.toml"), "banlist_add = [\"x/secret\"]\n").unwrap();
+    env.advance(3600);
+    env.run(&["adopt", "proj"]).unwrap();
+    assert_eq!(victim_files(&env, "victim"), before);
+    assert!(!env.fake.is_subvolume(&env.p("victim/secret")).unwrap());
+}
+
+/// The same with a build dir from the config reached through a symlink to shared data.
+#[test]
+fn adopt_banlist_symlinked_parent_keeps_shared_data() {
+    let env = Env::new("[projects.demo]\nbanlist_add = [\"web/node_modules\"]\n");
+    make_rust_project(&env, "demo");
+    let shared = env.base.join("shared/web/node_modules/pkg");
+    fs::create_dir_all(&shared).unwrap();
+    fs::write(shared.join("local-patch.js"), "hand written").unwrap();
+    std::os::unix::fs::symlink("../../shared/web", env.p("demo/web")).unwrap();
+    env.advance(10);
+    env.run(&["adopt", "demo"]).unwrap();
+    assert!(shared.join("local-patch.js").exists());
+    assert!(!env.fake.is_subvolume(&env.base.join("shared/web/node_modules")).unwrap());
+}
+
+/// Tick banlist enforcement and conversion must not create, replace or move through a symlink.
+#[test]
+fn tick_banlist_does_not_follow_symlinks() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::create_dir_all(env.p("victim/emptydir")).unwrap();
+    write_files(&env.p("victim/data"), 3, "v");
+    let before = victim_files(&env, "victim");
+    std::os::unix::fs::symlink("../victim", env.p("demo/s")).unwrap();
+    fs::write(
+        env.p("demo/.bpm.toml"),
+        "banlist_add = [\"s/evil\", \"s/emptydir\", \"s/data\"]\n[policy]\nkeep_build_on_adopt = false\nbanlist_settle = \"0s\"\n",
+    )
+    .unwrap();
+    for _ in 0..2 {
+        env.advance(3600);
+        env.run(&["tick"]).unwrap();
+    }
+    assert_eq!(victim_files(&env, "victim"), before);
+    for n in ["victim/emptydir", "victim/data"] {
+        assert!(!env.fake.is_subvolume(&env.p(n)).unwrap(), "{n}");
+    }
+    assert!(env.state("demo").pending_convert.is_empty());
+}
+
+/// restore into a directory that became a symlink must not overwrite the link target.
+#[test]
+fn restore_refuses_symlinked_parent() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    write_files(&env.p("demo/web/config"), 2, "snapcfg");
+    env.advance(600);
+    env.run(&["snap", "demo"]).unwrap();
+    let id = env.snaps("demo").last().unwrap().id.to_string();
+    write_files(&env.p("victim/config"), 2, "victimcfg");
+    let before = victim_files(&env, "victim");
+    fs::remove_dir_all(env.p("demo/web")).unwrap();
+    std::os::unix::fs::symlink("../victim", env.p("demo/web")).unwrap();
+    env.advance(600);
+    let err = env.run(&["restore", "demo", &id, "web/config", "--overwrite"]).unwrap_err();
+    assert_eq!(bpm::error::exit_code_for(&err), 7, "{err:#}");
+    assert_eq!(victim_files(&env, "victim"), before);
+    // single files too
+    let outside = env.base.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("app.toml"), "system file outside project").unwrap();
+    fs::remove_file(env.p("demo/web")).unwrap();
+    std::os::unix::fs::symlink(&outside, env.p("demo/web")).unwrap();
+    assert!(env.run(&["restore", "demo", &id, "web/config/snapcfg0.txt", "--overwrite"]).is_err());
+    assert_eq!(fs::read_to_string(outside.join("app.toml")).unwrap(), "system file outside project");
+}
