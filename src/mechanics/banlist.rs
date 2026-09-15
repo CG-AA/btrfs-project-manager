@@ -62,11 +62,12 @@ pub fn enforce_cheap(
         match std::fs::symlink_metadata(&full) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 st.pending_convert.remove(rel);
-                let wanted = match eff.policy.banlist_precreate {
-                    Precreate::All => true,
-                    Precreate::None => false,
-                    Precreate::Primary => eff.primary_banlist.contains(relpath) || st.banlist_seen.contains(rel),
-                };
+                let wanted = !eff.never_precreate.contains(relpath)
+                    && match eff.policy.banlist_precreate {
+                        Precreate::All => true,
+                        Precreate::None => false,
+                        Precreate::Primary => eff.primary_banlist.contains(relpath) || st.banlist_seen.contains(rel),
+                    };
                 let parent_ok = full.parent().is_some_and(|p| p.is_dir());
                 if wanted && allow_create && parent_ok {
                     ctx.btrfs.create_subvolume(&full)?;

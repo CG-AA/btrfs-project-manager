@@ -96,7 +96,7 @@ impl Default for GlobalCfg {
             archive_dir: "/archives/bpm".into(),
             archive_zstd_level: 19,
             heavy_min_free: ByteSize(10 << 30),
-            profile_order: ["generic", "python", "node", "cmake", "rust"].map(String::from).to_vec(),
+            profile_order: ["generic", "python", "node", "make", "just", "cmake", "rust"].map(String::from).to_vec(),
             hook_throttle: Duration::from_secs(120),
             destructive_patterns: vec![
                 r"\brm\s+(-[a-zA-Z]*[rRf]|--recursive|--force)".into(),
@@ -188,15 +188,23 @@ impl Default for ContainerCfg {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileCfg {
     #[serde(default)]
     pub markers: Vec<String>,
     #[serde(default)]
     pub banlist: Vec<String>,
+    /// false: never create this profile's banned directories ahead of time (make treats an
+    /// existing `build` directory as an up-to-date non-phony `build` target)
+    #[serde(default = "yes")]
+    pub precreate: bool,
     #[serde(default)]
     pub policy: toml::Table,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

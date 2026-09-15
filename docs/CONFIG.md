@@ -38,7 +38,7 @@ alone (and stays in snapshots). The same applies to paths given to `bpm restore`
 | `archive_dir` | `"/archives/bpm"` | where `bpm archive` writes |
 | `archive_zstd_level` | `19` | zstd level for archives |
 | `heavy_min_free` | `"10G"` | adopt, convert, collapse and recompress pause below this free space |
-| `profile_order` | generic, python, node, cmake, rust | order in which matched profiles apply |
+| `profile_order` | generic, python, node, make, just, cmake, rust | order in which matched profiles apply |
 | `hook_throttle` | `"2m"` | Claude hook: minimum spacing for non-destructive commands |
 | `destructive_patterns` | see default file | regexes; a matching shell command is snapshotted with no throttle |
 
@@ -71,7 +71,7 @@ Set these under `[defaults]`, `[profiles.X.policy]`, `[root.policy]`, `[projects
 
 | Key | Default | Meaning |
 |---|---|---|
-| `banlist_precreate` | `"primary"` | create missing banned dirs as empty subvolumes: `primary` = each profile's first entry, explicit project additions, and any dir seen before; `all`; `none` |
+| `banlist_precreate` | `"primary"` | create missing banned dirs as empty subvolumes: `primary` = each profile's first entry, explicit project additions, and any dir seen before; `all`; `none`. Never for entries only a `precreate = false` profile bans (see Profiles) |
 | `banlist_settle` | `"2m"` | a plain banned dir is converted only after no file in it changed for this long |
 | `keep_build_on_adopt` | `true` | reflink build contents into the new nested subvolumes during adopt |
 | `snapshot.min_interval` | `"5m"` | minimum spacing of automatic snapshots |
@@ -110,8 +110,9 @@ Durations accept `90s`, `5m`, `6h`, `14d`, `8w` and combinations like `1h 30m`. 
 Built in: `rust` (`Cargo.toml` → `target`), `cmake` (`CMakeLists.txt` → `build`,
 `cmake-build-debug`, `cmake-build-release`, `out`), `node` (`package.json` → `node_modules`,
 `dist`, `.next`, `.turbo`), `python` (`pyproject.toml`, `requirements.txt`, `setup.py` → `.venv`,
-`venv`, `__pycache__`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`), `generic` (none). A project
-matches every profile with a marker file at its top level. A `[profiles.<name>]` table in the
+`venv`, `__pycache__`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`), `just` (`justfile`, `Justfile`,
+`.justfile` → `build`), `make` (`Makefile`, `makefile`, `GNUmakefile` → `build`), `generic` (none). A
+project matches every profile with a marker file at its top level. A `[profiles.<name>]` table in the
 config replaces the built-in profile of that name or adds a new one:
 
 ```toml
@@ -121,6 +122,12 @@ banlist = ["zig-out", ".zig-cache"]
 [profiles.zig.policy.snapshot]
 min_interval = "10m"
 ```
+
+`precreate = false` in a profile means bpm never creates its banned directories ahead of time
+(`banlist_precreate`), not even after the build tool deleted one; a directory the build creates is
+still converted. The built-in `make` profile sets it: an empty `build/` would make a `build:` target
+that is not `.PHONY` look up to date. Another source of the same entry (a profile without it,
+`banlist`, or a `banlist_add`) allows creating it again.
 
 ## `<project>/.bpm.toml`
 

@@ -52,6 +52,8 @@ pub struct EffectiveConfig {
     pub banlist: Vec<RelPath>,
     /// Banlist entries created ahead of time under `banlist_precreate = "primary"`.
     pub primary_banlist: Vec<RelPath>,
+    /// Banlist entries only profiles with `precreate = false` ban: never created ahead of time.
+    pub never_precreate: Vec<RelPath>,
     pub sentinels: Vec<String>,
     pub policy: Policy,
     pub origins: BTreeMap<String, String>,
@@ -179,12 +181,22 @@ pub fn effective_for(
 
     let mut banlist: Vec<String> = str_list(&cfg.defaults, "banlist");
     let mut primary: Vec<String> = Vec::new();
+    // entries banned only by `precreate = false` profiles are never created ahead of time; any
+    // other source of the same entry allows it
+    let mut quiet: Vec<String> = Vec::new();
+    let mut loud: Vec<String> = banlist.clone();
     for pname in &profiles {
         let p = profile_map.get(pname).with_context(|| format!("project {name}: unknown profile {pname:?}"))?;
         banlist.extend(p.banlist.iter().cloned());
-        primary.extend(p.banlist.first().cloned());
+        if p.precreate {
+            primary.extend(p.banlist.first().cloned());
+            loud.extend(p.banlist.iter().cloned());
+        } else {
+            quiet.extend(p.banlist.iter().cloned());
+        }
         deep_merge(&mut table, &p.policy, &format!("profiles.{pname}"), "", &mut origins);
     }
+    loud.extend(root.banlist_add.iter().cloned());
     banlist.extend(root.banlist_add.iter().cloned());
     deep_merge(&mut table, &root.policy, &format!("root({})", root.path.display()), "", &mut origins);
 
@@ -195,6 +207,7 @@ pub fn effective_for(
         if let Some(o) = layer {
             banlist.extend(o.banlist_add.iter().cloned());
             primary.extend(o.banlist_add.iter().cloned());
+            loud.extend(o.banlist_add.iter().cloned());
             remove.extend(o.banlist_remove.iter().cloned());
             sentinels_add.extend(o.sentinels_add.iter().cloned());
             let mut policy = o.policy.clone();
@@ -224,6 +237,13 @@ pub fn effective_for(
         }
     }
     let primary_banlist: Vec<RelPath> = primary.iter().filter_map(norm).filter(|p| banlist.contains(p)).collect();
+    let loud: Vec<RelPath> = loud.iter().filter_map(norm).collect();
+    let mut never_precreate: Vec<RelPath> = Vec::new();
+    for q in quiet.iter().filter_map(norm) {
+        if banlist.contains(&q) && !loud.contains(&q) && !never_precreate.contains(&q) {
+            never_precreate.push(q);
+        }
+    }
     let managed = managed_from(file, global_over, &mut ignored_project_keys);
     Ok(EffectiveConfig {
         name: name.into(),
@@ -232,6 +252,7 @@ pub fn effective_for(
         profiles,
         banlist,
         primary_banlist,
+        never_precreate,
         sentinels,
         policy,
         origins,
@@ -343,6 +364,37 @@ level = 15
         let file: ProjectOverride = toml::from_str("managed = true").unwrap();
         let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), Some(&file)).unwrap();
         assert!(e.managed, "opting in weakens nothing");
+    }
+
+    #[test]
+    fn make_build_is_banned_but_never_precreated() {
+        let cfg = parse("version=1\n[[root]]\npath='/x'\n", "t").unwrap();
+        let eff = |markers: &[&str], file: Option<&ProjectOverride>| {
+            let dir = tempfile::tempdir().unwrap();
+            for m in markers {
+                std::fs::write(dir.path().join(m), "").unwrap();
+            }
+            effective_for(&cfg, &cfg.roots[0], "p", dir.path(), file).unwrap()
+        };
+        let e = eff(&["Makefile"], None);
+        assert_eq!(e.profiles, vec!["make"]);
+        assert!(e.is_banned("build"));
+        assert_eq!(e.never_precreate, vec!["build"]);
+        assert!(e.primary_banlist.is_empty());
+
+        let e = eff(&["Justfile", "Cargo.toml"], None);
+        assert_eq!(e.banlist, vec!["build", "target"]);
+        assert_eq!(e.primary_banlist, vec!["build", "target"]);
+        assert!(e.never_precreate.is_empty());
+
+        // another source of the same entry allows creating it
+        let e = eff(&["Makefile", "justfile"], None);
+        assert!(e.never_precreate.is_empty());
+        assert!(eff(&["Makefile", "CMakeLists.txt"], None).never_precreate.is_empty());
+        let add: ProjectOverride = toml::from_str("banlist_add = ['build']").unwrap();
+        let e = eff(&["GNUmakefile"], Some(&add));
+        assert!(e.never_precreate.is_empty());
+        assert_eq!(e.primary_banlist, vec!["build"]);
     }
 
     #[test]

@@ -7,6 +7,17 @@ banlist = ["target"]
 markers = ["CMakeLists.txt"]
 banlist = ["build", "cmake-build-debug", "cmake-build-release", "out"]
 
+[just]
+markers = ["justfile", "Justfile", ".justfile"]
+banlist = ["build"]
+
+# precreate = false: an empty `build` directory bpm creates would make a non-phony `build:` target
+# look up to date
+[make]
+markers = ["Makefile", "makefile", "GNUmakefile"]
+banlist = ["build"]
+precreate = false
+
 [node]
 markers = ["package.json"]
 banlist = ["node_modules", "dist", ".next", ".turbo"]

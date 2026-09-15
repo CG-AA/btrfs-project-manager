@@ -64,13 +64,14 @@ pub fn run(ctx: &Ctx, a: ConfigArgs) -> Result<()> {
             let eff = crate::project::effective(ctx, &root, &name, &path)?;
             emit(ctx, &eff, || {
                 let mut out = format!(
-                    "# {} ({})\nmanaged = {}\nprofiles = {:?}\nbanlist = {:?}\nprimary_banlist = {:?}\nsentinels = {:?}\n",
+                    "# {} ({})\nmanaged = {}\nprofiles = {:?}\nbanlist = {:?}\nprimary_banlist = {:?}\nnever_precreate = {:?}\nsentinels = {:?}\n",
                     name,
                     path.display(),
                     eff.managed,
                     eff.profiles,
                     eff.banlist,
                     eff.primary_banlist,
+                    eff.never_precreate,
                     eff.sentinels
                 );
                 if let Ok(toml::Value::Table(t)) = toml::Value::try_from(&eff.policy) {
