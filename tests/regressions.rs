@@ -977,3 +977,31 @@ fn throttled_stats_still_block_thinning() {
     drop(unit);
     assert!(!bpm::mechanics::observe::thin_allowed(&env.state("demo"), &env.snaps("demo")), "snapshot #{id} unseen");
 }
+
+// ---------------- the project file cannot stop management ----------------
+
+/// `.bpm.toml` may not set `managed = false`: it stops snapshots and the shrink guard together,
+/// so it is the same weakening the protected policy tables exist to prevent, only total. A wipe
+/// after it must still be snapshotted and still freeze the project.
+#[test]
+fn project_file_cannot_switch_management_off() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    for i in 0..5 {
+        fs::write(env.p(&format!("demo/src/src{i}.txt")), format!("changed {i} {}", "more content ".repeat(40)))
+            .unwrap();
+        env.advance(900);
+        env.run(&["tick"]).unwrap();
+    }
+    let before = env.snaps("demo").len();
+    fs::write(env.p("demo/.bpm.toml"), "managed = false\n").unwrap();
+    for i in 0..40 {
+        let _ = fs::remove_file(env.p(&format!("demo/src/src{i}.txt")));
+    }
+    env.advance(900);
+    env.run(&["tick"]).unwrap();
+    assert!(env.snaps("demo").len() > before, "the wipe was snapshotted: {}", describe(&env, "demo"));
+    assert!(env.state("demo").frozen.is_some(), "the wipe froze the project: {}", describe(&env, "demo"));
+    assert!(env.doctor().contains("managed = false"), "doctor reports the ignored key:\n{}", env.doctor());
+}

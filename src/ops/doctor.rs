@@ -272,6 +272,16 @@ pub fn findings(ctx: &Ctx, fix: bool) -> Vec<Finding> {
             if let Ok(eff) = project::effective(ctx, &root, &f.name, &f.path) {
                 check_nested_leftovers(&mut d, &f.path, &eff.banlist);
                 check_kept_leftovers(&mut d, &f.path, &eff.banlist_paths());
+                if !eff.ignored_project_keys.is_empty() {
+                    d.warn(
+                        format!(
+                            "{}: .bpm.toml sets {}, which only the admin config may change; ignored",
+                            f.name,
+                            eff.ignored_project_keys.join(", ")
+                        ),
+                        Some("set it under [projects.\"name\"] in the admin config".into()),
+                    );
+                }
                 if !eff.policy.snapshot.stats {
                     d.warn(
                         format!("{}: snapshot.stats = false, so the shrink guard cannot see deletions", f.name),

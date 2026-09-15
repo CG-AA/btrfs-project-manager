@@ -12,7 +12,25 @@ use std::path::{Path, PathBuf};
 /// Policy tables `<project>/.bpm.toml` may not set: the file is writable by whatever works in the
 /// repository (an AI agent included), and these decide whether deletions are noticed and how
 /// long history is kept. Set them in the admin config (`[projects."name".policy]`).
+///
+/// `managed` is protected the same way, but only against being turned off (see `managed_from`):
+/// `managed = false` stops snapshots and the guard outright, which is every one of these tables
+/// weakened at once.
 pub const PROTECTED_FROM_PROJECT_FILE: &[&str] = &["shrink_guard", "thin"];
+
+/// Whether the project is managed, refusing `managed = false` from `.bpm.toml`: a file inside the
+/// project cannot opt the project out of protection, only the admin config can. Opting *in*
+/// (`managed = true`) weakens nothing and is allowed from either layer.
+fn managed_from(file: Option<&ProjectOverride>, global: Option<&ProjectOverride>, ignored: &mut Vec<String>) -> bool {
+    let from_file = match file.and_then(|f| f.managed) {
+        Some(false) => {
+            ignored.push("managed = false".into());
+            None
+        }
+        other => other,
+    };
+    from_file.or_else(|| global.and_then(|o| o.managed)).unwrap_or(true)
+}
 
 pub const POLICY_KEYS: &[&str] = &[
     "banlist_precreate",
@@ -206,7 +224,7 @@ pub fn effective_for(
         }
     }
     let primary_banlist: Vec<RelPath> = primary.iter().filter_map(norm).filter(|p| banlist.contains(p)).collect();
-    let managed = file.and_then(|f| f.managed).or_else(|| global_over.and_then(|o| o.managed)).unwrap_or(true);
+    let managed = managed_from(file, global_over, &mut ignored_project_keys);
     Ok(EffectiveConfig {
         name: name.into(),
         path: path.into(),
@@ -296,13 +314,36 @@ level = 15
     fn detection_defaults_to_generic_and_project_config_can_be_disabled() {
         let mut cfg = parse(CFG, "t").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let file: ProjectOverride = toml::from_str("managed = false").unwrap();
+        let file: ProjectOverride = toml::from_str("managed = true").unwrap();
         let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), Some(&file)).unwrap();
         assert_eq!(e.profiles, vec!["generic"]);
-        assert!(!e.managed);
+        assert!(e.managed);
         cfg.global.project_config = false;
         let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), Some(&file)).unwrap();
         assert!(e.managed);
+    }
+
+    #[test]
+    fn project_file_cannot_turn_management_off() {
+        let cfg = parse(CFG, "t").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file: ProjectOverride = toml::from_str("managed = false").unwrap();
+        let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), Some(&file)).unwrap();
+        assert!(e.managed, "a file inside the project cannot stop bpm protecting it");
+        assert_eq!(e.ignored_project_keys, vec!["managed = false"]);
+    }
+
+    #[test]
+    fn admin_config_can_still_turn_management_off() {
+        let cfg =
+            parse("version=1\n[[root]]\npath='/x'\n[projects.other]\nmanaged = false\n", "t").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), None).unwrap();
+        assert!(!e.managed);
+        // and the project file cannot turn it back on either way round
+        let file: ProjectOverride = toml::from_str("managed = true").unwrap();
+        let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), Some(&file)).unwrap();
+        assert!(e.managed, "opting in weakens nothing");
     }
 
     #[test]

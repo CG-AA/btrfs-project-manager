@@ -125,7 +125,7 @@ min_interval = "10m"
 ## `<project>/.bpm.toml`
 
 ```toml
-managed = true                 # false: bpm ignores this project entirely
+managed = true                 # ignored when false (see below); set it in the admin config
 profile = "auto"               # or ["rust", "node"]
 banlist_add = ["out", "data/cache"]
 banlist_remove = ["dist"]
@@ -138,5 +138,8 @@ dormant_after = "30d"
 An agent working in the repository can edit this file, so it cannot change hooks or sudo
 behaviour, and its `[policy.shrink_guard]` and `[policy.thin]` tables are ignored (with a warning):
 whether deletions freeze cleanup and how long history is kept are set in the admin config, for
-example `[projects."name".policy.thin]`. Set `global.project_config = false` to ignore these files
+example `[projects."name".policy.thin]`. For the same reason `managed = false` in this file is
+ignored — it would stop snapshots and the guard together — while `managed = true` is honoured,
+since opting in weakens nothing. To stop managing a project, set `managed = false` under
+`[projects."name"]` in the admin config. Set `global.project_config = false` to ignore these files
 entirely.
