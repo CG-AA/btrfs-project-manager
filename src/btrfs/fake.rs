@@ -4,6 +4,10 @@
 //! Counters follow the kernel rules verified on real btrfs: content changes bump `ctransid`
 //! and `generation`; snapshotting bumps only the source `generation`; snapshots inherit
 //! `ctransid`; nested subvolumes appear as empty placeholder directories in snapshots.
+//!
+//! Like the kernel for buffered writes, counters move only when changes are flushed: on `sync`,
+//! on `snapshot` (for the source) and on `defragment`. Reading counters without a flush sees
+//! the state of the last flush, so code that forgets to sync fails tests.
 
 use super::{Btrfs, DefragOpts, DuStats, FsUsage, SubvolInfo, Uuid};
 use crate::util::walk::{self, EntryKind};
@@ -208,6 +212,7 @@ fn copy_tree(src: &Path, dst: &Path, subvols: &HashSet<(u64, u64)>) -> Result<()
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dst)?;
     let probe = |p: &Path, _ino: u64| key_of(p).map(|k| subvols.contains(&k)).unwrap_or(false);
+    let mut copied = Vec::new();
     for entry in walkdir::WalkDir::new(src).follow_links(false).min_depth(1) {
         let entry = entry?;
         let rel = entry.path().strip_prefix(src).unwrap();
@@ -236,9 +241,26 @@ fn copy_tree(src: &Path, dst: &Path, subvols: &HashSet<(u64, u64)>) -> Result<()
             std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
         } else if ft.is_file() {
             std::fs::copy(entry.path(), &target)?;
-            let f = std::fs::File::options().write(true).open(&target)?;
-            f.set_modified(md.modified()?)?;
         }
+        copied.push((target, md));
+    }
+    // a snapshot keeps every timestamp: set them children first, since creating entries bumps
+    // the parent directory's mtime
+    for (target, md) in copied.iter().rev() {
+        set_times(target, md)?;
+    }
+    Ok(())
+}
+
+fn set_times(path: &Path, md: &std::fs::Metadata) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    let ts = [
+        libc::timespec { tv_sec: md.atime(), tv_nsec: md.atime_nsec() },
+        libc::timespec { tv_sec: md.mtime(), tv_nsec: md.mtime_nsec() },
+    ];
+    if unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("fake: set times of {}", path.display()));
     }
     Ok(())
 }
@@ -249,9 +271,8 @@ impl Btrfs for FakeBtrfs {
     }
 
     fn subvol_info(&self, path: &Path) -> Result<SubvolInfo> {
-        let mut st = self.st.lock().unwrap();
-        let (root, key) = Self::root_of(&st, path)?;
-        Self::observe(self.now(), &mut st, &root, key);
+        let st = self.st.lock().unwrap();
+        let (_, key) = Self::root_of(&st, path)?;
         Ok(Self::info_of(&st.subvols[&key]))
     }
 
@@ -270,7 +291,32 @@ impl Btrfs for FakeBtrfs {
         Ok(self.st.lock().unwrap().usage)
     }
 
-    fn sync(&self, _path: &Path) -> Result<()> {
+    fn sync(&self, path: &Path) -> Result<()> {
+        let mut st = self.st.lock().unwrap();
+        let Ok(abs) = std::fs::canonicalize(path) else {
+            return Ok(());
+        };
+        // syncfs flushes the whole filesystem: start from the outermost registered subvolume
+        let Some(top) = abs.ancestors().filter(|a| key_of(a).is_some_and(|k| st.subvols.contains_key(&k))).last()
+        else {
+            return Ok(());
+        };
+        let top = top.to_path_buf();
+        let now = self.now();
+        let mut it = walkdir::WalkDir::new(&top).follow_links(false).into_iter();
+        while let Some(Ok(e)) = it.next() {
+            if !e.file_type().is_dir() {
+                continue;
+            }
+            let Some(k) = key_of(e.path()) else { continue };
+            let Some(sv) = st.subvols.get_mut(&k) else { continue };
+            sv.path = e.path().to_path_buf();
+            if sv.ro {
+                it.skip_current_dir();
+                continue;
+            }
+            Self::observe(now, &mut st, e.path(), k);
+        }
         Ok(())
     }
 
@@ -342,7 +388,8 @@ impl Btrfs for FakeBtrfs {
 
     fn defragment(&self, path: &Path, opts: &DefragOpts) -> Result<()> {
         let mut st = self.st.lock().unwrap();
-        let (_, key) = Self::root_of(&st, path)?;
+        let (root, key) = Self::root_of(&st, path)?;
+        Self::observe(self.now(), &mut st, &root, key);
         st.transid += 1;
         let t = st.transid;
         let sv = st.subvols.get_mut(&key).unwrap();
@@ -429,6 +476,7 @@ mod tests {
         fs::write(proj.join("a"), "1").unwrap();
         fb.create_subvolume(&proj.join("target")).unwrap();
         fs::write(proj.join("target/big"), "xxxx").unwrap();
+        fb.sync(&proj).unwrap();
         let before = fb.subvol_info(&proj).unwrap();
 
         let snap = d.path().join("s1");
@@ -444,9 +492,12 @@ mod tests {
         assert!(!snap.join("target/big").exists(), "nested subvolume is a placeholder");
 
         fs::write(proj.join("target/big"), "yyyyyy").unwrap();
+        fb.sync(&proj).unwrap();
         assert_eq!(fb.subvol_info(&proj).unwrap().ctransid, before.ctransid, "nested write invisible");
         fs::remove_file(proj.join("a")).unwrap();
-        assert!(fb.subvol_info(&proj).unwrap().ctransid > before.ctransid, "delete bumps ctransid");
+        assert_eq!(fb.subvol_info(&proj).unwrap().ctransid, before.ctransid, "not flushed yet");
+        fb.sync(d.path()).unwrap();
+        assert!(fb.subvol_info(&proj).unwrap().ctransid > before.ctransid, "delete bumps ctransid once flushed");
 
         // rename keeps identity
         let moved = d.path().join("renamed");

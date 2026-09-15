@@ -183,3 +183,24 @@ pub fn describe(env: &Env, name: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// Install a global hook script for `event` (e.g. "post-snapshot").
+pub fn install_hook(env: &Env, event: &str, name: &str, script: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = env.base.join("hooks").join(event);
+    fs::create_dir_all(&dir).unwrap();
+    let hook = dir.join(name);
+    fs::write(&hook, format!("#!/bin/sh\n{script}\nexit 0\n")).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    hook
+}
+
+/// Entries of the root whose name contains `marker`.
+pub fn root_entries(env: &Env, marker: &str) -> Vec<PathBuf> {
+    fs::read_dir(&env.root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().contains(marker))
+        .collect()
+}

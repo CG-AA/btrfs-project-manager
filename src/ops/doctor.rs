@@ -3,8 +3,9 @@
 use crate::cli::DoctorArgs;
 use crate::ctx::Ctx;
 use crate::mechanics::adopt;
+use crate::mechanics::retire::{self, Expect};
 use crate::output::{Table, emit};
-use crate::project;
+use crate::project::{self, Leftover};
 use crate::store::journal::Journal;
 use crate::store::{SnapshotKind, SnapshotMeta, Stage, Unit};
 use anyhow::Result;
@@ -262,6 +263,32 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
     Ok(())
 }
 
+/// The original tree left by an adopt interrupted after the swap: delete it only if it matches
+/// the adopt snapshot of the project now at `orig`.
+fn adopt_leftover_expect(
+    ctx: &Ctx,
+    store: &crate::store::Store,
+    root: &crate::config::RootCfg,
+    base: &str,
+) -> Option<Expect<'static>> {
+    let unit = store.unit(base);
+    let rec = unit.read_record().ok()??;
+    let snap =
+        unit.snapshots().ok()?.into_iter().find(|m| m.kind == SnapshotKind::Adopt && rec.owns(Some(m.source_uuid)))?;
+    let eff = project::effective(ctx, root, base, &root.path.join(base)).ok()?;
+    let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
+    let exclude = eff.banlist_paths();
+    let stats = crate::util::walk::tree_stats(
+        &unit.snapshot_path(snap.id),
+        &probe,
+        &exclude,
+        &[],
+        std::time::Duration::from_secs(24 * 3600),
+    )
+    .ok()?;
+    Some(Expect::Tree { stats: Some(stats), not_after: snap.created, exclude })
+}
+
 fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crate::store::Store) {
     let ctx = d.ctx;
     let Ok(rd) = std::fs::read_dir(&root.path) else {
@@ -270,32 +297,28 @@ fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crat
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let path = e.path();
+        let Some(leftover) = Leftover::parse(&name) else { continue };
+        let orig = root.path.join(leftover.base());
         let is_sub = ctx.btrfs.is_subvolume(&path).unwrap_or(false);
-        if let Some(base) = name.strip_suffix(".bpm-tmp") {
-            let orig = root.path.join(base);
-            let orig_sub = ctx.btrfs.is_subvolume(&orig).unwrap_or(false);
-            if is_sub && orig.is_dir() && !orig_sub {
+        let orig_sub = ctx.btrfs.is_subvolume(&orig).unwrap_or(false);
+        match leftover {
+            Leftover::Keep { op, .. } => d.error(
+                format!(
+                    "{}: kept by an interrupted or unverified {op} because it may hold changes that exist nowhere else",
+                    path.display()
+                ),
+                Some(format!("compare with {} (bpm diff), merge by hand, then delete it", orig.display())),
+            ),
+            Leftover::Tmp { .. } if is_sub && orig.is_dir() && !orig_sub => {
                 let p = path.clone();
                 d.fixable(
                     "warn",
                     format!("{}: adopt was interrupted before the swap", path.display()),
-                    "doctor --fix deletes the partial copy".into(),
+                    "doctor --fix deletes the partial copy (the original is untouched)".into(),
                     || ctx.btrfs.delete_subvolume(&p, true),
                 );
-            } else if !is_sub && orig_sub {
-                let p = path.clone();
-                d.fixable(
-                    "warn",
-                    format!("{}: old directory left after adopt swap", path.display()),
-                    "doctor --fix removes it".into(),
-                    || Ok(std::fs::remove_dir_all(&p)?),
-                );
-            } else {
-                d.error(format!("{}: unexpected leftover; inspect manually", path.display()), None);
             }
-        } else if let Some(base) = name.strip_suffix(".bpm-old") {
-            let orig = root.path.join(base);
-            if ctx.btrfs.is_subvolume(&orig).unwrap_or(false) {
+            Leftover::Tmp { ref base } | Leftover::Old { ref base } if !is_sub && orig_sub => {
                 let registered = store.unit(base).read_record().ok().flatten().is_some();
                 let p = path.clone();
                 let (root_c, base_s) = (root.clone(), base.to_string());
@@ -306,7 +329,7 @@ fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crat
                         path.display(),
                         if registered { "" } else { " or registration" }
                     ),
-                    "doctor --fix registers the project and removes the old copy".into(),
+                    "doctor --fix registers the project, then removes the old copy if it matches the adopt snapshot (otherwise keeps it as .bpm-keep-adopt-*)".into(),
                     || {
                         if !registered {
                             adopt::adopt(
@@ -321,23 +344,20 @@ fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crat
                                 },
                             )?;
                         }
-                        Ok(std::fs::remove_dir_all(&p)?)
+                        match adopt_leftover_expect(ctx, store, &root_c, &base_s) {
+                            Some(expect) => retire::retire(ctx, &p, &expect, &[], "adopt").map(|_| ()),
+                            None => {
+                                retire::retire(ctx, &p, &Expect::Tree { stats: None, not_after: jiff::Timestamp::MIN, exclude: vec![] }, &[], "adopt")
+                                    .map(|_| ())
+                            }
+                        }
                     },
                 );
-            } else {
-                d.error(
-                    format!(
-                        "{}: leftover next to a non-subvolume {}; inspect manually",
-                        path.display(),
-                        orig.display()
-                    ),
-                    None,
-                );
             }
-        } else if let Some(idx) = name.find(".bpm-rollback-") {
-            let base = &name[..idx];
-            let orig = root.path.join(base);
-            if !orig.exists() {
+            Leftover::Tmp { .. } | Leftover::Old { .. } => {
+                d.error(format!("{}: unexpected leftover; inspect manually", path.display()), None);
+            }
+            Leftover::Rollback { .. } if !orig.exists() => {
                 let (p, o) = (path.clone(), orig.clone());
                 d.fixable(
                     "error",
@@ -345,47 +365,47 @@ fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crat
                     format!("doctor --fix renames it back to {}", orig.display()),
                     || Ok(std::fs::rename(&p, &o)?),
                 );
-            } else {
-                let nested = has_nested(ctx, &path);
-                if nested {
-                    d.error(format!("{}: rollback leftover still contains nested subvolumes; move them into {} or delete with `btrfs subvolume delete -R`", path.display(), orig.display()), None);
-                } else {
-                    let p = path.clone();
-                    d.fixable(
-                        "warn",
-                        format!(
-                            "{}: pre-rollback tree left behind (it is also saved as a rollback snapshot)",
-                            path.display()
-                        ),
-                        "doctor --fix deletes it".into(),
-                        || ctx.btrfs.delete_subvolume(&p, false),
-                    );
-                }
+            }
+            Leftover::Rollback { ref base } => {
+                // deletable only when a rollback snapshot of exactly this tree exists
+                let uuid = ctx.btrfs.subvol_info(&path).ok().map(|i| i.uuid);
+                let safety = store
+                    .unit(base)
+                    .snapshots()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|m| Some(m.source_uuid) == uuid && m.kind == SnapshotKind::Rollback)
+                    .max_by_key(|m| m.id);
+                let p = path.clone();
+                d.fixable(
+                    "warn",
+                    format!(
+                        "{}: pre-rollback tree left behind{}",
+                        path.display(),
+                        if safety.is_some() { " (it is also saved as a rollback snapshot)" } else { "" }
+                    ),
+                    "doctor --fix deletes it if it is identical to its rollback snapshot, otherwise keeps it as .bpm-keep-rollback-*".into(),
+                    move || match &safety {
+                        Some(m) => retire::retire(ctx, &p, &Expect::Snapshot { kept: m }, &[], "rollback").map(|_| ()),
+                        None => retire::retire(ctx, &p, &Expect::Tree { stats: None, not_after: jiff::Timestamp::MIN, exclude: vec![] }, &[], "rollback").map(|_| ()),
+                    },
+                );
             }
         }
     }
-}
-
-fn has_nested(ctx: &Ctx, dir: &Path) -> bool {
-    walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .min_depth(1)
-        .into_iter()
-        .flatten()
-        .any(|e| crate::util::walk::entry_is_subvol(&e, &|p, i| ctx.is_subvol(p, i)))
 }
 
 fn check_nested_leftovers(d: &mut Doc, live: &Path, banlist: &[String]) {
     let ctx = d.ctx;
     for rel in banlist {
         let full = live.join(rel);
+        let full_sub = ctx.btrfs.is_subvolume(&full).unwrap_or(false);
         for suffix in [".bpm-tmp", ".bpm-old"] {
             let p = crate::util::fs::sibling(&full, suffix);
             if p.symlink_metadata().is_err() {
                 continue;
             }
             let p_sub = ctx.btrfs.is_subvolume(&p).unwrap_or(false);
-            let full_sub = ctx.btrfs.is_subvolume(&full).unwrap_or(false);
             let pc = p.clone();
             if p_sub && !full_sub {
                 d.fixable(
@@ -395,12 +415,28 @@ fn check_nested_leftovers(d: &mut Doc, live: &Path, banlist: &[String]) {
                     || ctx.btrfs.delete_subvolume(&pc, true),
                 );
             } else if !p_sub && full_sub {
+                // unchanged since the nested subvolume was created: its contents were copied there
+                let created = ctx.btrfs.subvol_info(&full).ok().and_then(|i| i.otime).unwrap_or(jiff::Timestamp::MIN);
                 d.fixable(
                     "warn",
                     format!("{}: old build directory left after conversion", p.display()),
-                    "doctor --fix removes it".into(),
-                    || Ok(std::fs::remove_dir_all(&pc)?),
+                    "doctor --fix removes it if unchanged since the conversion, otherwise keeps it as .bpm-keep-convert-*".into(),
+                    move || {
+                        retire::retire(ctx, &pc, &Expect::Tree { stats: None, not_after: created, exclude: vec![] }, &[], "convert")
+                            .map(|_| ())
+                    },
                 );
+            }
+        }
+        if let (Some(parent), Some(fname)) = (full.parent(), full.file_name()) {
+            let prefix = format!("{}{}", fname.to_string_lossy(), retire::KEEP_MARKER);
+            for e in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    d.error(
+                        format!("{}: kept because it may hold changes that exist nowhere else", e.path().display()),
+                        Some("inspect, merge by hand, then delete it".into()),
+                    );
+                }
             }
         }
     }

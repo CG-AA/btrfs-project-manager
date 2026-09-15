@@ -56,6 +56,9 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
     for w in &report.warnings {
         tracing::warn!("{w}");
     }
+    for k in &report.kept {
+        tracing::warn!("the replaced version is kept at {}", k.display());
+    }
     if a.to.is_none() && !report.restored.is_empty() && !ctx.opts.dry_run {
         let mut st = pref.unit.read_state()?;
         let target = Target::for_project(&pref, &eff);
@@ -86,6 +89,8 @@ pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<()> {
     let snaps = pref.unit.snapshots()?;
     let meta = super::select(ctx, &pref.unit, &snaps, &a.snapshot)?.clone();
     if newest(&snaps).is_some_and(|n| n.id == meta.id) {
+        // in-place writes reach the counters only when flushed
+        ctx.btrfs.sync(pref.path())?;
         let live = ctx.btrfs.subvol_info(pref.path())?;
         if crate::policy::change::identical(&live, &meta) {
             return Err(refused(format!("{} is already identical to snapshot #{}", pref.name(), meta.id)));

@@ -66,7 +66,20 @@ pub fn cp_a(src: &Path, dst: &Path, mode: ReflinkMode) -> Result<()> {
         ReflinkMode::Always => "--reflink=always",
         ReflinkMode::Auto => "--reflink=auto",
     };
-    let out = Command::new("cp").arg("-a").arg(reflink).arg("-T").arg(src).arg(dst).output().context("spawn cp")?;
+    let run = |reflink: &str| Command::new("cp").arg("-a").arg(reflink).arg("-T").arg(src).arg(dst).output();
+    let mut out = run(reflink).context("spawn cp")?;
+    // btrfs refuses to clone between files whose NOCOW (chattr +C) flags differ, and cp -a does
+    // not copy that flag: such files are copied instead of cloned
+    if !out.status.success()
+        && mode == ReflinkMode::Always
+        && String::from_utf8_lossy(&out.stderr).contains("failed to clone")
+    {
+        tracing::warn!(
+            "cp: some files under {} cannot be reflinked (NOCOW?); copying their data instead",
+            src.display()
+        );
+        out = run("--reflink=auto").context("spawn cp")?;
+    }
     if !out.status.success() {
         bail!("cp -a {} {} failed: {}", src.display(), dst.display(), String::from_utf8_lossy(&out.stderr).trim());
     }

@@ -239,3 +239,171 @@ fn hook_snapshot_change_counts_as_activity() {
         .any(|m| snap_read(&env, "demo", m.id, "src/src0.txt").as_deref() == Some("precious original"));
     assert!(precious, "{}", describe(&env, "demo"));
 }
+
+// ---------------- nothing is deleted without proof ----------------
+
+/// An edit saved while adopt copies a large build directory (after its first verification).
+#[test]
+fn adopt_edit_during_build_copy_is_not_lost() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    write_files(&env.p("demo/target/debug"), 4000, "big");
+    env.advance(10);
+    let root = env.root.clone();
+    let writer = std::thread::spawn(move || {
+        let marker = root.join("demo.bpm-tmp/target");
+        let t0 = std::time::Instant::now();
+        while t0.elapsed() < Duration::from_secs(60) {
+            if marker.exists() {
+                fs::write(root.join("demo/src/src0.txt"), "EDIT DURING ADOPT").unwrap();
+                return true;
+            }
+            std::thread::sleep(Duration::from_micros(50));
+        }
+        false
+    });
+    let r = env.run(&["adopt", "demo"]);
+    assert!(writer.join().unwrap(), "writer ran");
+    let live = fs::read_to_string(env.p("demo/src/src0.txt")).unwrap();
+    assert_eq!(live, "EDIT DURING ADOPT", "adopt result: {:?}", r.err());
+    assert!(root_entries(&env, ".bpm-").is_empty(), "{:?}", root_entries(&env, ".bpm-"));
+}
+
+/// A write into the original tree after the swap (a shell whose working directory is inside).
+#[test]
+fn adopt_keeps_original_written_after_swap() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    install_hook(
+        &env,
+        "post-snapshot",
+        "10-late",
+        "[ \"$BPM_SNAPSHOT_KIND\" = adopt ] && echo late > \"$BPM_PROJECT_PATH.bpm-old/src/late.txt\"",
+    );
+    env.run(&["adopt", "demo"]).unwrap();
+    let kept = root_entries(&env, ".bpm-keep-adopt-");
+    assert_eq!(kept.len(), 1, "{:?}", root_entries(&env, ".bpm-"));
+    assert_eq!(fs::read_to_string(kept[0].join("src/late.txt")).unwrap(), "late\n");
+}
+
+/// Hardlinks between top-level entries are split by the per-entry copy; adoption still verifies.
+#[test]
+fn adopt_with_hardlinks_across_entries() {
+    let env = Env::new("");
+    make_project(&env, "demo", 5);
+    fs::create_dir_all(env.p("demo/bin")).unwrap();
+    fs::hard_link(env.p("demo/src/src0.txt"), env.p("demo/bin/tool")).unwrap();
+    env.advance(10);
+    env.run(&["adopt", "demo"]).unwrap();
+    assert!(env.fake.is_subvolume(&env.p("demo")).unwrap());
+    assert!(env.p("demo/bin/tool").exists());
+}
+
+/// A write that reaches the old tree after rollback's safety snapshot.
+#[test]
+fn rollback_keeps_previous_tree_written_after_safety_snapshot() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    env.advance(600);
+    fs::write(env.p("demo/src/extra.txt"), "x").unwrap();
+    env.run(&["snap", "demo"]).unwrap();
+    install_hook(
+        &env,
+        "post-snapshot",
+        "10-late",
+        "[ \"$BPM_SNAPSHOT_KIND\" = rollback ] && echo late > \"$BPM_PROJECT_PATH/src/late.txt\"",
+    );
+    env.run(&["rollback", "demo", "1"]).unwrap();
+    let kept = root_entries(&env, ".bpm-keep-rollback-");
+    assert_eq!(kept.len(), 1, "{:?}", root_entries(&env, ".bpm-"));
+    assert_eq!(fs::read_to_string(kept[0].join("src/late.txt")).unwrap(), "late\n");
+    assert!(!env.p("demo/src/extra.txt").exists(), "rolled back");
+    let rec = env.unit("demo").read_record().unwrap().unwrap();
+    assert_eq!(rec.uuid, env.fake.subvol_info(&env.p("demo")).unwrap().uuid, "record follows the new subvolume");
+}
+
+/// An in-place edit that has not been flushed must not make rollback refuse as "identical".
+#[test]
+fn rollback_sees_unflushed_changes() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::write(env.p("demo/src/src0.txt"), "corrupted by an agent").unwrap();
+    env.run(&["rollback", "demo", "latest"]).unwrap();
+    assert!(fs::read_to_string(env.p("demo/src/src0.txt")).unwrap().contains("lorem"));
+}
+
+/// Archive with --delete-live: an edit during the (long) compression keeps the live project.
+#[test]
+fn archive_delete_live_refuses_after_concurrent_edit() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    install_hook(&env, "pre-archive", "10-edit", "echo late > \"$BPM_PROJECT_PATH/src/late.txt\"");
+    let err =
+        env.run(&["archive", "demo", "--level", "3", "--delete-live", "--delete-snapshots", "--yes"]).unwrap_err();
+    assert_eq!(bpm::error::exit_code_for(&err), 7, "{err:#}");
+    assert!(env.p("demo/src/late.txt").exists());
+    assert!(!env.snaps("demo").is_empty());
+}
+
+/// Archive of an older snapshot with --delete-live would delete newer work.
+#[test]
+fn archive_delete_live_refuses_older_snapshot() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::write(env.p("demo/src/new-work.txt"), "new work").unwrap();
+    env.advance(60);
+    assert!(env.run(&["archive", "demo", "--snapshot", "1", "--level", "1", "--delete-live", "--yes"]).is_err());
+    assert!(env.p("demo/src/new-work.txt").exists());
+}
+
+/// restore --overwrite of a directory must not destroy a nested subvolume inside it.
+#[test]
+fn restore_overwrite_keeps_nested_subvolume() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::create_dir_all(env.p("demo/data")).unwrap();
+    fs::write(env.p("demo/data/keep"), "snap content").unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    let id = env.snaps("demo").last().unwrap().id.to_string();
+    env.fake.create_subvolume(&env.p("demo/data/db")).unwrap();
+    fs::write(env.p("demo/data/db/precious"), "only copy").unwrap();
+    env.advance(600);
+    env.run(&["restore", "demo", &id, "data", "--overwrite"]).unwrap();
+    assert_eq!(fs::read_to_string(env.p("demo/data/keep")).unwrap(), "snap content");
+    let found = walkdir::WalkDir::new(&env.root).into_iter().flatten().any(|e| e.file_name() == "precious");
+    assert!(found, "the nested subvolume's data survives");
+}
+
+/// A user change during recompression keeps the pre-recompress snapshot and counts as activity.
+#[test]
+fn recompress_keeps_old_snapshot_after_concurrent_change() {
+    let env = Env::new("");
+    make_project(&env, "demo", 50);
+    fs::write(env.p("demo/important.txt"), "only copy").unwrap();
+    env.run(&["adopt", "demo"]).unwrap();
+    env.advance(61 * 86400);
+    for _ in 0..3 {
+        env.run(&["tick"]).unwrap();
+        env.advance(600);
+    }
+    let mut st = env.state("demo");
+    st.recompress = None;
+    env.unit("demo").write_state(&st).unwrap();
+    let hook = install_hook(&env, "pre-recompress", "10-user", "rm -f \"$BPM_PROJECT_PATH/important.txt\"");
+    env.run(&["tick"]).unwrap();
+    fs::remove_file(hook).unwrap();
+    assert!(env.fake.ops().iter().any(|o| o.starts_with("defrag")), "recompress ran");
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    assert!(any_snap_has(&env, "demo", "important.txt"), "{}", describe(&env, "demo"));
+    assert_eq!(env.state("demo").stage, Stage::Active);
+}

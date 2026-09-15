@@ -1,5 +1,6 @@
 //! Keep banned directories (build output, caches) as nested subvolumes so snapshots skip them.
 
+use super::retire::{self, Expect, Outcome};
 use crate::config::{EffectiveConfig, Precreate};
 use crate::ctx::Ctx;
 use crate::error::refused;
@@ -140,18 +141,27 @@ pub fn convert(ctx: &Ctx, live: &Path, rel: &str, keep_contents: bool, force: bo
         tracing::info!("[dry-run] convert {} into a nested subvolume", full.display());
         return Ok(());
     }
+    // compared with file timestamps, so the real clock
+    let started = jiff::Timestamp::now();
     ctx.btrfs.create_subvolume(&tmp)?;
     copy_owner_mode(&md, &tmp)?;
+    let mut copied = None;
     if keep_contents {
         if let Err(e) = cp_a(&full, &tmp, ctx.reflink) {
             let _ = ctx.btrfs.delete_subvolume(&tmp, true);
             return Err(e);
         }
+        let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
+        copied =
+            Some(crate::util::walk::tree_stats(&tmp, &probe, &[], &[], std::time::Duration::from_secs(24 * 3600))?);
     }
     let _ = super::xattr::copy_times(&full, &tmp);
     rename_exchange(&full, &tmp)?;
     std::fs::rename(&tmp, &old)?;
-    std::fs::remove_dir_all(&old).with_context(|| format!("remove {}", old.display()))?;
+    let expect = Expect::Tree { stats: copied, not_after: started, exclude: vec![] };
+    if let Outcome::Kept(k) = retire::retire(ctx, &old, &expect, &[], "convert")? {
+        tracing::warn!("{}: previous contents kept at {}", full.display(), k.display());
+    }
     tracing::info!("converted {} into a nested subvolume", full.display());
     Ok(())
 }

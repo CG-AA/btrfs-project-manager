@@ -7,6 +7,7 @@ pub mod banlist;
 pub mod guard;
 pub mod observe;
 pub mod recompress;
+pub mod retire;
 pub mod rollback;
 pub mod snapshot;
 pub mod xattr;

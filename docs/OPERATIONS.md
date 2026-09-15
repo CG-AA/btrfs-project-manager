@@ -103,6 +103,14 @@ bpm rollback myproj <that id>
 `name.bpm-tmp`, `name.bpm-old`, `name.bpm-rollback-*`, snapshots without metadata, and stale
 journals. `sudo bpm doctor --fix` repairs the safe cases and never deletes the only copy of data.
 
+**A `name.bpm-keep-<op>-<time>` directory appeared.** bpm replaces trees in adopt, convert,
+rollback and restore, and deletes the replaced tree only when it can prove the tree holds nothing
+newer than what was kept (unchanged since the copy or snapshot, no nested subvolumes or mounts,
+not in use). Otherwise it keeps the tree under this name and logs an error. This happens when
+something wrote into the project during the operation, for example a shell whose working
+directory was inside. Compare it with the project, copy back what you need, then delete it.
+`bpm doctor` reports these and never removes them.
+
 ## Limits to know
 
 - Snapshots are on the same disk. They protect against deletion and overwrites, not disk failure.
@@ -112,6 +120,8 @@ journals. `sudo bpm doctor --fix` repairs the safe cases and never deletes the o
 - Nested subvolumes you create inside a project yourself are not covered by its snapshots.
   `bpm status <project>` warns about them.
 - Snapshots are crash-consistent. Databases that need a clean state can use a `pre-snapshot` hook.
+- `bpm archive --delete-live` deletes the live project only if it is still identical to the
+  archived snapshot; an edit during compression, or archiving an older `--snapshot`, keeps it.
 - Changes are detected when the filesystem flushes. Every check forces a flush first.
 
 ## Checks after deployment

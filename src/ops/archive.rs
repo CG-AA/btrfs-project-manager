@@ -4,6 +4,7 @@ use crate::cli::{ArchiveArgs, UnarchiveArgs};
 use crate::ctx::Ctx;
 use crate::error::refused;
 use crate::hooks::{self, HookCtx, HookEvent};
+use crate::mechanics::retire::{self, Expect};
 use crate::mechanics::snapshot::{self, DeleteMode, SnapOpts};
 use crate::mechanics::{Target, archive, banlist, observe, rollback};
 use crate::output::emit;
@@ -30,6 +31,8 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
             if !live_exists {
                 return Err(refused(format!("{} does not exist; pass --snapshot", pref.path().display())));
             }
+            // in-place writes reach the counters only when flushed
+            ctx.btrfs.sync(pref.path())?;
             let live = ctx.btrfs.subvol_info(pref.path())?;
             match newest(&snaps) {
                 Some(n) if crate::policy::change::identical(&live, n) => n.clone(),
@@ -65,6 +68,17 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
         at: ctx.now(),
         snapshot: meta.id,
     });
+    let banned: Vec<std::path::PathBuf> = eff.banlist_paths();
+    if a.delete_live && live_exists {
+        if let Err(why) = retire::prove(ctx, pref.path(), &Expect::Snapshot { kept: &meta }, &banned) {
+            pref.unit.write_state(&st)?;
+            return Err(refused(format!(
+                "archive written, but {} is not exactly snapshot #{} ({why}); live project and snapshots kept",
+                pref.path().display(),
+                meta.id
+            )));
+        }
+    }
     let mut deleted = Vec::new();
     if a.delete_snapshots {
         let mut remaining = snaps.clone();
@@ -83,35 +97,23 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
         }
     }
     if a.delete_live && live_exists {
-        let mut unprotected = Vec::new();
-        let mut it = walkdir::WalkDir::new(pref.path()).follow_links(false).min_depth(1).into_iter();
-        while let Some(Ok(e)) = it.next() {
-            if crate::util::walk::entry_is_subvol(&e, &|p, i| ctx.is_subvol(p, i)) {
-                let rel = e.path().strip_prefix(pref.path()).unwrap().to_string_lossy().into_owned();
-                if !eff.banlist.contains(&rel) {
-                    unprotected.push(rel);
-                }
-                it.skip_current_dir();
+        // the live project is deleted only if it is exactly what was archived: unchanged since
+        // that snapshot (so nothing was edited during a long compression, and an older
+        // --snapshot is refused), nothing uses it, and its only nested subvolumes are build dirs
+        match retire::prove(ctx, pref.path(), &Expect::Snapshot { kept: &meta }, &banned) {
+            Ok(proof) => {
+                retire::delete(ctx, proof)?;
+                st.set_stage(Stage::Archived, ctx.now());
+            }
+            Err(why) => {
+                pref.unit.write_state(&st)?;
+                return Err(refused(format!(
+                    "archive written, but {} is not exactly snapshot #{} ({why}); live project kept",
+                    pref.path().display(),
+                    meta.id
+                )));
             }
         }
-        if !unprotected.is_empty() {
-            pref.unit.write_state(&st)?;
-            return Err(refused(format!(
-                "archive written, but {} contains nested subvolumes that are not in the archive ({}); live project kept",
-                pref.path().display(),
-                unprotected.join(", ")
-            )));
-        }
-        let writers = crate::util::proc::writers_under(pref.path());
-        if !writers.is_empty() {
-            return Err(refused(format!(
-                "archive written, but files are open for writing under {}: {}; live project kept",
-                pref.path().display(),
-                crate::util::proc::describe(&writers)
-            )));
-        }
-        ctx.btrfs.delete_subvolume(pref.path(), true)?;
-        st.set_stage(Stage::Archived, ctx.now());
     }
     pref.unit.write_state(&st)?;
     hooks::run(ctx, HookEvent::PostArchive, &hctx)?;

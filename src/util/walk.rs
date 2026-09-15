@@ -23,7 +23,15 @@ pub struct TreeStats {
     pub symlinks: u64,
     pub others: u64,
     pub bytes: u64,
+    /// Bytes counted once per path (hardlinks counted every time): comparable between a tree
+    /// and a copy that does not preserve hardlinks.
+    #[serde(default)]
+    pub path_bytes: u64,
     pub newest_mtime: Option<Timestamp>,
+    /// Latest mtime or ctime of any entry, plus the root's mtime, at nanosecond precision.
+    /// `ctime` cannot be set by tools (`mv`, `cp -p`, `tar` and `rsync -a` all bump it).
+    #[serde(default)]
+    pub newest_change: Option<Timestamp>,
     #[serde(default)]
     pub sentinels: BTreeMap<String, bool>,
     pub complete: bool,
@@ -59,6 +67,10 @@ pub fn tree_stats(
     let mut st = TreeStats { complete: true, ..Default::default() };
     let mut seen: HashSet<u64> = HashSet::new();
     let mut newest: i64 = i64::MIN;
+    let mut newest_change: i128 = i128::MIN;
+    if let Ok(md) = std::fs::symlink_metadata(root) {
+        newest_change = nanos(md.mtime(), md.mtime_nsec());
+    }
     let walker = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
         if e.depth() == 0 {
             return true;
@@ -85,12 +97,14 @@ pub fn tree_stats(
             Err(_) => continue,
         };
         newest = newest.max(md.mtime());
+        newest_change = newest_change.max(nanos(md.mtime(), md.mtime_nsec())).max(nanos(md.ctime(), md.ctime_nsec()));
         if ft.is_dir() {
             st.dirs += 1;
         } else if ft.is_symlink() {
             st.symlinks += 1;
         } else if ft.is_file() {
             st.files += 1;
+            st.path_bytes += md.len();
             if md.nlink() <= 1 || seen.insert(md.ino()) {
                 st.bytes += md.len();
             }
@@ -109,8 +123,34 @@ pub fn tree_stats(
     if newest != i64::MIN {
         st.newest_mtime = Timestamp::from_second(newest).ok();
     }
+    if newest_change != i128::MIN {
+        st.newest_change = Timestamp::from_nanosecond(newest_change).ok();
+    }
     st.walk_ms = start.elapsed().as_millis() as u64;
     Ok(st)
+}
+
+fn nanos(sec: i64, nsec: i64) -> i128 {
+    sec as i128 * 1_000_000_000 + nsec as i128
+}
+
+/// Nested subvolume roots below `dir` (not descending into them). A walk error other than an
+/// entry vanishing is an error: callers use the result to decide what is safe to delete.
+pub fn nested_subvolumes(dir: &Path, probe: SubvolProbe) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut it = WalkDir::new(dir).follow_links(false).min_depth(1).into_iter();
+    while let Some(entry) = it.next() {
+        let e = match entry {
+            Ok(e) => e,
+            Err(err) if err.io_error().is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => continue,
+            Err(err) => return Err(anyhow::Error::from(err).context(format!("scan {}", dir.display()))),
+        };
+        if entry_is_subvol(&e, probe) {
+            out.push(e.path().to_path_buf());
+            it.skip_current_dir();
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -208,6 +248,8 @@ mod tests {
         .unwrap();
         assert_eq!(st.files, 2);
         assert_eq!(st.bytes, 5, "hardlinks counted once");
+        assert_eq!(st.path_bytes, 10, "path bytes count every link");
+        assert!(st.newest_change.is_some());
         assert_eq!(st.dirs, 1);
         assert_eq!(st.sentinels.get(".git"), Some(&true));
         assert_eq!(st.sentinels.get("docs"), Some(&false));

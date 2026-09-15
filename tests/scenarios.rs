@@ -398,7 +398,7 @@ fn rollback_dropping_build_dirs_keeps_user_subvolumes() {
         .unwrap()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.to_string_lossy().contains(".bpm-rollback-"))
+        .filter(|p| p.to_string_lossy().contains(".bpm-keep-rollback-"))
         .collect();
     assert_eq!(leftovers.len(), 1, "old tree kept because a user subvolume could not be moved");
     assert_eq!(fs::read_to_string(leftovers[0].join("data/precious")).unwrap(), "only copy");

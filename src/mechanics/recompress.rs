@@ -153,6 +153,9 @@ pub fn sample_gain(ctx: &Ctx, live: &Path, exclude: &[std::path::PathBuf], level
     Ok(if base == 0 { 0.0 } else { 1.0 - high as f64 / base as f64 })
 }
 
+/// What a defragment must not change about an entry: kind, size, mtime, mode.
+type EntryKey = (crate::util::walk::EntryKind, u64, i128, u32);
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RecompressReport {
     pub done: bool,
@@ -215,6 +218,7 @@ pub fn recompress(
         skip(&mut report, why);
         return Ok(report);
     }
+    ctx.btrfs.sync(&live)?;
     let live_info = ctx.btrfs.subvol_info(&live)?;
     if !force {
         let gain = sample_gain(ctx, &live, &eff.stats_exclude(), level)?;
@@ -267,6 +271,40 @@ pub fn recompress(
         skip(&mut report, "shrink guard froze the project after defragment".into());
         return Ok(report);
     }
+    // Defragment rewrites extents, not names, sizes or times. Anything else that differs between
+    // the snapshots before and after was changed by someone else during the defragment: keep the
+    // old snapshot (the only copy of the previous state) and count the change as activity.
+    let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
+    let listing = |id: u64| -> Result<Vec<(std::path::PathBuf, EntryKey)>> {
+        Ok(crate::util::walk::tree_index(&pref.unit.snapshot_path(id), &probe)?
+            .into_iter()
+            .map(|(k, v)| (k, (v.kind, v.size, v.mtime_ns, v.mode)))
+            .collect())
+    };
+    let untouched = listing(old.id)? == listing(m.id)?;
+    ctx.btrfs.sync(&live)?;
+    let after = ctx.btrfs.subvol_info(&live)?;
+    if !untouched {
+        tracing::warn!(
+            "{}: the project changed during recompression; snapshot #{} is kept and the change counts as activity",
+            pref.name(),
+            old.id
+        );
+        observe::note_live(st, &after, ctx.now());
+        report.free_after = ctx.free_bytes(&live)?;
+        st.recompress = Some(RecompressRecord {
+            at: ctx.now(),
+            level,
+            ctransid: after.ctransid,
+            bytes_before: report.free_before,
+            bytes_after: report.free_after,
+            skipped: None,
+        });
+        journal.finish()?;
+        report.done = true;
+        hooks::run(ctx, HookEvent::PostRecompress, &hctx)?;
+        return Ok(report);
+    }
     if !old.hold && old.kind.class() != crate::store::KindClass::Keep {
         match snapshot::delete(
             ctx,
@@ -290,8 +328,6 @@ pub fn recompress(
             old.id
         );
     }
-    ctx.btrfs.sync(&live)?;
-    let after = ctx.btrfs.subvol_info(&live)?;
     observe::note_tool_change(st, &live_info, &after, ctx.now());
     report.free_after = ctx.free_bytes(&live)?;
     st.recompress = Some(RecompressRecord {
