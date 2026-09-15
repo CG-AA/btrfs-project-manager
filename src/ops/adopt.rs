@@ -89,17 +89,20 @@ pub fn convert(ctx: &Ctx, a: ConvertArgs) -> Result<()> {
     let eff = super::effective(ctx, &pref)?;
     let rel = crate::util::fs::safe_relative(&a.path).ok_or_else(|| usage("path must be relative to the project"))?;
     let rel = rel.to_string_lossy().into_owned();
-    if !eff.banlist.contains(&rel) {
+    if !eff.is_banned(&rel) {
         tracing::warn!("{rel} is not in the banlist of {}; it will be excluded from snapshots anyway", pref.name());
     }
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    ctx.btrfs.sync(pref.path())?;
+    let before = ctx.btrfs.subvol_info(pref.path())?;
     banlist::convert(ctx, pref.path(), &rel, !a.discard_contents, a.force)?;
     let mut st = pref.unit.read_state()?;
     st.pending_convert.remove(&rel);
     st.banlist_seen.insert(rel.clone());
     ctx.btrfs.sync(pref.path())?;
-    st.tool_ctransid = ctx.btrfs.subvol_info(pref.path())?.ctransid;
-    pref.unit.write_state(&st)?;
+    let after = ctx.btrfs.subvol_info(pref.path())?;
+    crate::mechanics::observe::note_tool_change(&mut st, &before, &after, ctx.now());
+    lu.write_state(&st)?;
     emit(ctx, &serde_json::json!({"project": pref.name(), "converted": rel}), || {
         format!("{}: {rel} is now a nested subvolume", pref.name())
     });

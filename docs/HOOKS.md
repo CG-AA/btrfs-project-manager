@@ -98,8 +98,10 @@ For every shell command the agent is about to run, `bpm snap --claude-hook`:
 3. treats the command as destructive when it matches `global.destructive_patterns` (`rm -r`,
    `git clean`, `git reset --hard`, `git checkout .`, `find -delete`, `rsync --delete`, `mv`, …);
 4. for non-destructive commands, skips projects snapshotted within `global.hook_throttle`;
-5. runs `sudo -n bpm snap <project> --kind hook --if-changed --quick`, which flushes the filesystem
-   and snapshots only if the project changed since its newest snapshot;
+5. runs `sudo -n bpm snap <project> --kind hook --if-changed --quick --no-sudo …` (subcommand
+   first, so a sudoers rule for `bpm snap *` matches), which flushes the filesystem and snapshots
+   only if the project changed since its newest snapshot. `--quick` skips the file count to stay
+   fast; the next tick counts the snapshot and runs the shrink guard on it before any retention;
 6. always exits 0, so a failure never blocks the agent.
 
 If a tick holds the project lock for a long file count, the hook snapshot goes ahead without the

@@ -4,8 +4,9 @@ use crate::cli::{ArchiveArgs, UnarchiveArgs};
 use crate::ctx::Ctx;
 use crate::error::refused;
 use crate::hooks::{self, HookCtx, HookEvent};
+use crate::mechanics::retire::{self, Expect};
 use crate::mechanics::snapshot::{self, DeleteMode, SnapOpts};
-use crate::mechanics::{Target, adopt, archive, banlist, rollback};
+use crate::mechanics::{Target, archive, banlist, observe, rollback};
 use crate::output::emit;
 use crate::project::{self, ProjectRef};
 use crate::store::{ProjectRecord, SnapshotKind, Stage, newest};
@@ -17,7 +18,7 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
     if (a.delete_live || a.delete_snapshots) && !a.yes {
         return Err(refused("--delete-live and --delete-snapshots need --yes"));
     }
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let mut st = pref.unit.read_state()?;
     if st.frozen.is_some() {
         return Err(refused(format!("{} is frozen; resolve that first (bpm status {})", pref.name(), pref.name())));
@@ -25,11 +26,13 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
     let mut snaps = pref.unit.snapshots()?;
     let live_exists = ctx.btrfs.subvol_info(pref.path()).map(|i| i.uuid == pref.record.uuid).unwrap_or(false);
     let meta = match &a.snapshot {
-        Some(sel) => super::select(ctx, &snaps, sel)?.clone(),
+        Some(sel) => super::select(ctx, &pref.unit, &snaps, sel)?.clone(),
         None => {
             if !live_exists {
                 return Err(refused(format!("{} does not exist; pass --snapshot", pref.path().display())));
             }
+            // in-place writes reach the counters only when flushed
+            ctx.btrfs.sync(pref.path())?;
             let live = ctx.btrfs.subvol_info(pref.path())?;
             match newest(&snaps) {
                 Some(n) if crate::policy::change::identical(&live, n) => n.clone(),
@@ -57,6 +60,11 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
     let level = a.level.unwrap_or(ctx.cfg.global.archive_zstd_level);
     let report = archive::archive(ctx, &pref, &meta, nested, &dest, level, a.fast)?;
     if ctx.opts.dry_run {
+        emit(
+            ctx,
+            &serde_json::json!({"dry_run": true, "project": pref.name(), "snapshot": meta.id, "archive": report}),
+            || format!("[dry-run] {}: would archive snapshot #{} to {}", pref.name(), meta.id, report.file.display()),
+        );
         return Ok(());
     }
     st.archives.push(crate::store::ArchiveRecord {
@@ -65,13 +73,24 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
         at: ctx.now(),
         snapshot: meta.id,
     });
+    let banned: Vec<std::path::PathBuf> = eff.banlist_paths();
+    if a.delete_live && live_exists {
+        if let Err(why) = retire::prove(ctx, pref.path(), &Expect::Snapshot { kept: &meta }, &banned) {
+            lu.write_state(&st)?;
+            return Err(refused(format!(
+                "archive written, but {} is not exactly snapshot #{} ({why}); live project and snapshots kept",
+                pref.path().display(),
+                meta.id
+            )));
+        }
+    }
     let mut deleted = Vec::new();
     if a.delete_snapshots {
         let mut remaining = snaps.clone();
         for m in snaps.iter().filter(|m| !m.hold && m.id != meta.id) {
             snapshot::delete(
                 ctx,
-                &pref.unit,
+                &lu,
                 &pref.record,
                 &remaining,
                 m,
@@ -83,37 +102,25 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
         }
     }
     if a.delete_live && live_exists {
-        let mut unprotected = Vec::new();
-        let mut it = walkdir::WalkDir::new(pref.path()).follow_links(false).min_depth(1).into_iter();
-        while let Some(Ok(e)) = it.next() {
-            if crate::util::walk::entry_is_subvol(&e, &|p, i| ctx.is_subvol(p, i)) {
-                let rel = e.path().strip_prefix(pref.path()).unwrap().to_string_lossy().into_owned();
-                if !eff.banlist.contains(&rel) {
-                    unprotected.push(rel);
-                }
-                it.skip_current_dir();
+        // the live project is deleted only if it is exactly what was archived: unchanged since
+        // that snapshot (so nothing was edited during a long compression, and an older
+        // --snapshot is refused), nothing uses it, and its only nested subvolumes are build dirs
+        match retire::prove(ctx, pref.path(), &Expect::Snapshot { kept: &meta }, &banned) {
+            Ok(proof) => {
+                retire::delete(ctx, proof)?;
+                st.set_stage(Stage::Archived, ctx.now());
+            }
+            Err(why) => {
+                lu.write_state(&st)?;
+                return Err(refused(format!(
+                    "archive written, but {} is not exactly snapshot #{} ({why}); live project kept",
+                    pref.path().display(),
+                    meta.id
+                )));
             }
         }
-        if !unprotected.is_empty() {
-            pref.unit.write_state(&st)?;
-            return Err(refused(format!(
-                "archive written, but {} contains nested subvolumes that are not in the archive ({}); live project kept",
-                pref.path().display(),
-                unprotected.join(", ")
-            )));
-        }
-        let writers = crate::util::proc::writers_under(pref.path());
-        if !writers.is_empty() {
-            return Err(refused(format!(
-                "archive written, but files are open for writing under {}: {}; live project kept",
-                pref.path().display(),
-                crate::util::proc::describe(&writers)
-            )));
-        }
-        ctx.btrfs.delete_subvolume(pref.path(), true)?;
-        st.set_stage(Stage::Archived, ctx.now());
     }
-    pref.unit.write_state(&st)?;
+    lu.write_state(&st)?;
     hooks::run(ctx, HookEvent::PostArchive, &hctx)?;
     emit(
         ctx,
@@ -141,6 +148,29 @@ pub fn unarchive(ctx: &Ctx, a: UnarchiveArgs) -> Result<()> {
         None => archive::newest_archive(&dest, &a.project)?,
     };
     let manifest = archive::read_manifest(&file)?;
+    if manifest.project.is_empty()
+        || manifest.project.starts_with('.')
+        || manifest.project.contains('/')
+        || project::is_leftover_name(&manifest.project)
+    {
+        return Err(refused(format!("{}: manifest names an invalid project {:?}", file.display(), manifest.project)));
+    }
+    if ctx.opts.dry_run {
+        archive::verify(&file, &manifest)?;
+        emit(
+            ctx,
+            &serde_json::json!({"dry_run": true, "project": a.project, "archive": file, "recreate": !a.no_live}),
+            || {
+                format!(
+                    "[dry-run] {}: archive {} verified; would receive it{}",
+                    a.project,
+                    file.display(),
+                    if a.no_live { "" } else { " and recreate the project if its directory is gone" }
+                )
+            },
+        );
+        return Ok(());
+    }
     let mut pref = match project::resolve(ctx, &a.project) {
         Ok(p) => p,
         Err(_) => {
@@ -158,11 +188,11 @@ pub fn unarchive(ctx: &Ctx, a: UnarchiveArgs) -> Result<()> {
                 ctx.now(),
             );
             record.uuid_history = manifest.uuid_history.clone();
-            unit.write_record(&record)?;
+            unit.lock(ctx.cfg.global.lock_timeout)?.write_record(&record)?;
             ProjectRef { root, store, unit, record }
         }
     };
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let meta = archive::receive(ctx, &pref, &file, &manifest)?;
     let mut st = pref.unit.read_state()?;
     st.banlist_seen.extend(manifest.nested.iter().cloned());
@@ -177,7 +207,7 @@ pub fn unarchive(ctx: &Ctx, a: UnarchiveArgs) -> Result<()> {
                 meta.id
             );
         } else {
-            rollback::recreate(ctx, &mut pref, &meta)?;
+            rollback::recreate(ctx, &lu, &mut pref, &meta)?;
             let eff = super::effective(ctx, &pref)?;
             banlist::enforce_cheap(
                 ctx,
@@ -193,15 +223,11 @@ pub fn unarchive(ctx: &Ctx, a: UnarchiveArgs) -> Result<()> {
                 &target,
                 &SnapOpts::new(SnapshotKind::Post, format!("unarchived from #{}", meta.id)),
             )?;
-            adopt::init_state(ctx, &mut st, &eff, &pref.record, &post, pref.path())?;
-            st.frozen = None;
-            st.missing_since = None;
-            st.last_change_at = Some(ctx.now());
-            st.stage = Stage::Active;
+            observe::init_new_live(ctx, &eff, &mut st, &post, pref.path(), ctx.now())?;
             recreated = true;
         }
     }
-    pref.unit.write_state(&st)?;
+    lu.write_state(&st)?;
     emit(
         ctx,
         &serde_json::json!({"project": pref.name(), "received_snapshot": meta.id, "recreated": recreated}),

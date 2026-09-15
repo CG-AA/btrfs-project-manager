@@ -4,25 +4,32 @@ use crate::cli::{RestoreArgs, RollbackArgs};
 use crate::ctx::Ctx;
 use crate::error::{refused, usage};
 use crate::mechanics::snapshot::{self, SnapOpts};
-use crate::mechanics::{Target, adopt, banlist, rollback};
+use crate::mechanics::{Target, banlist, observe, rollback};
 use crate::output::emit;
-use crate::policy::shrink;
 use crate::project;
-use crate::store::{SnapshotKind, Stage, newest};
+use crate::store::{SnapshotKind, newest};
 use anyhow::Result;
 
 pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
     let mut pref = project::resolve(ctx, &a.project)?;
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let snaps = pref.unit.snapshots()?;
     let sel = a.snapshot.clone().unwrap_or_else(|| "latest".into());
-    let meta = super::select(ctx, &snaps, &sel)?.clone();
+    let meta = super::select(ctx, &pref.unit, &snaps, &sel)?.clone();
     if a.recreate {
         if !a.paths.is_empty() {
             return Err(usage("--recreate restores the whole project; do not list paths"));
         }
-        let new_uuid = rollback::recreate(ctx, &mut pref, &meta)?;
+        let new_uuid = rollback::recreate(ctx, &lu, &mut pref, &meta)?;
         if ctx.opts.dry_run {
+            emit(ctx, &serde_json::json!({"dry_run": true, "project": pref.name(), "recreate_from": meta.id}), || {
+                format!(
+                    "[dry-run] {}: would recreate {} from snapshot #{}",
+                    pref.name(),
+                    pref.path().display(),
+                    meta.id
+                )
+            });
             return Ok(());
         }
         let eff = super::effective(ctx, &pref)?;
@@ -32,13 +39,8 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
         let target = Target::for_project(&pref, &eff);
         let post =
             snapshot::take(ctx, &target, &SnapOpts::new(SnapshotKind::Post, format!("recreated from #{}", meta.id)))?;
-        st.frozen = None;
-        st.missing_since = None;
-        st.set_stage(Stage::Active, ctx.now());
-        adopt::init_state(ctx, &mut st, &eff, &pref.record, &post, pref.path())?;
-        st.last_change_at = Some(ctx.now());
-        st.stage = Stage::Active;
-        pref.unit.write_state(&st)?;
+        observe::init_new_live(ctx, &eff, &mut st, &post, pref.path(), ctx.now())?;
+        lu.write_state(&st)?;
         emit(
             ctx,
             &serde_json::json!({"project": pref.name(), "recreated_from": meta.id, "uuid": new_uuid, "snapshot": post.id}),
@@ -57,10 +59,20 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
     if a.paths.is_empty() {
         return Err(usage("name the paths to restore, or pass --recreate for the whole project"));
     }
+    if a.to.is_none() && !ctx.btrfs.subvol_info(pref.path()).is_ok_and(|i| i.uuid == pref.record.uuid) {
+        return Err(refused(format!(
+            "{} is not the live project; recreate it with `bpm restore {} --recreate`, or copy out with --to DIR",
+            pref.path().display(),
+            pref.name()
+        )));
+    }
     let eff = super::effective(ctx, &pref)?;
     let report = rollback::restore_paths(ctx, &pref, &eff, &meta, &a.paths, a.to.as_deref(), a.overwrite)?;
     for w in &report.warnings {
         tracing::warn!("{w}");
+    }
+    for k in &report.kept {
+        tracing::warn!("the replaced version is kept at {}", k.display());
     }
     if a.to.is_none() && !report.restored.is_empty() && !ctx.opts.dry_run {
         let mut st = pref.unit.read_state()?;
@@ -70,11 +82,10 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
             &target,
             &SnapOpts::new(SnapshotKind::Post, format!("after restoring from #{}", meta.id)),
         )?;
-        st.snap_ctransid = post.source_ctransid;
-        st.last_snapshot_at = Some(post.created);
-        st.last_change_at = Some(ctx.now());
-        st.set_stage(Stage::Active, ctx.now());
-        pref.unit.write_state(&st)?;
+        observe::note_snapshot(&mut st, &post);
+        let mut snaps = pref.unit.snapshots()?;
+        observe::after_command(ctx, &lu, &target, &eff, pref.record.adopted, &mut st, &mut snaps)?;
+        lu.write_state(&st)?;
     }
     emit(ctx, &report, || {
         let mut s: Vec<String> = report.restored.iter().map(|p| format!("restored {}", p.display())).collect();
@@ -89,17 +100,22 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
 pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<()> {
     let mut pref = project::resolve(ctx, &a.project)?;
     let eff = super::effective(ctx, &pref)?;
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let snaps = pref.unit.snapshots()?;
-    let meta = super::select(ctx, &snaps, &a.snapshot)?.clone();
+    let meta = super::select(ctx, &pref.unit, &snaps, &a.snapshot)?.clone();
     if newest(&snaps).is_some_and(|n| n.id == meta.id) {
+        // in-place writes reach the counters only when flushed
+        ctx.btrfs.sync(pref.path())?;
         let live = ctx.btrfs.subvol_info(pref.path())?;
         if crate::policy::change::identical(&live, &meta) {
             return Err(refused(format!("{} is already identical to snapshot #{}", pref.name(), meta.id)));
         }
     }
-    let report = rollback::rollback(ctx, &mut pref, &eff, &meta, a.drop_build_dirs, a.force)?;
+    let report = rollback::rollback(ctx, &lu, &mut pref, &eff, &meta, a.drop_build_dirs, a.force)?;
     if ctx.opts.dry_run {
+        emit(ctx, &serde_json::json!({"dry_run": true, "project": pref.name(), "rollback_to": meta.id}), || {
+            format!("[dry-run] {}: would roll back to snapshot #{}", pref.name(), meta.id)
+        });
         return Ok(());
     }
     let mut st = pref.unit.read_state()?;
@@ -109,27 +125,37 @@ pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<()> {
     let mut o = SnapOpts::new(SnapshotKind::Post, format!("rolled back to #{}", meta.id));
     o.pair = Some(report.safety_snapshot);
     let post = snapshot::take(ctx, &target, &o)?;
-    st.snap_ctransid = post.source_ctransid;
-    st.tool_ctransid = 0;
-    st.last_snapshot_at = Some(post.created);
-    st.last_change_at = Some(ctx.now());
-    st.set_stage(Stage::Active, ctx.now());
+    let now = ctx.now();
+    // a new live subvolume: its counters start over, and the rollback itself is activity
+    ctx.btrfs.sync(pref.path())?;
+    let live = ctx.btrfs.subvol_info(pref.path())?;
+    observe::note_replaced_live(&mut st, &live, now);
+    observe::note_snapshot(&mut st, &post);
+    observe::update_stage(ctx, &target, &eff, pref.record.adopted, &mut st, now);
     let mut unfroze = false;
-    if let (Some(f), Some(stats)) = (&st.frozen, post.complete_stats()) {
-        let reference_files = f
-            .ref_snap
-            .and_then(|id| snaps.iter().find(|m| m.id == id))
-            .and_then(|m| m.complete_stats())
-            .map(|s| s.files)
-            .or(st.ref_stats.as_ref().map(|r| r.files))
-            .unwrap_or(0);
-        if stats.files as f64 >= 0.7 * reference_files as f64 {
-            st.frozen = None;
-            st.ref_stats = Some(shrink::reset(stats, post.id));
-            unfroze = true;
+    match (&st.frozen, post.complete_stats()) {
+        (Some(f), Some(stats)) => {
+            let snaps = pref.unit.snapshots()?;
+            let reference_files = f
+                .ref_snap
+                .and_then(|id| snaps.iter().find(|m| m.id == id))
+                .and_then(|m| m.complete_stats())
+                .map(|s| s.files)
+                .or(st.ref_stats.as_ref().map(|r| r.files))
+                .unwrap_or(0);
+            if stats.files as f64 >= 0.7 * reference_files as f64 {
+                st.frozen = None;
+                unfroze = true;
+                observe::accept_as_reference(&mut st, &post);
+            } else {
+                observe::mark_evaluated(&mut st, &post);
+            }
         }
+        // the user chose this state: it is the new reference
+        (None, _) => observe::accept_as_reference(&mut st, &post),
+        (Some(_), None) => observe::mark_evaluated(&mut st, &post),
     }
-    pref.unit.write_state(&st)?;
+    lu.write_state(&st)?;
     emit(
         ctx,
         &serde_json::json!({"project": pref.name(), "rolled_back_to": meta.id, "safety_snapshot": report.safety_snapshot, "post_snapshot": post.id, "report": report, "unfroze": unfroze}),

@@ -1,17 +1,17 @@
 //! Adopt: convert a plain top-level directory into a subvolume (or register an existing one).
 
 use super::Target;
+use super::retire::{self, Expect, Outcome, counts};
 use super::snapshot::{self, SnapOpts};
-use crate::config::{EffectiveConfig, RootCfg};
+use crate::config::RootCfg;
 use crate::ctx::Ctx;
 use crate::error::refused;
 use crate::hooks::{self, HookCtx, HookEvent};
-use crate::policy::{lifecycle, shrink};
 use crate::project::{self, ProjectRef};
 use crate::store::journal::Journal;
 use crate::store::{ProjectRecord, ProjectState, SnapshotKind, Store};
-use crate::util::fs::{copy_owner_mode, cp_a, rename_exchange, sibling};
-use crate::util::time::age;
+use crate::util::fs::{copy_owner_mode, cp_a, sibling};
+use crate::util::relpath::RelPath;
 use crate::util::{proc, walk};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -38,24 +38,14 @@ pub struct AdoptReport {
     pub nested: Vec<String>,
     pub snapshot: u64,
     pub stage: String,
+    /// The original directory, kept because it changed while it was being adopted.
+    pub leftover: Option<PathBuf>,
 }
 
 const MIN_FREE: u64 = 2 << 30;
 
-fn nested_subvolumes(ctx: &Ctx, dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut it = walkdir::WalkDir::new(dir).follow_links(false).min_depth(1).into_iter();
-    while let Some(Ok(e)) = it.next() {
-        if walk::entry_is_subvol(&e, &|p, i| ctx.is_subvol(p, i)) {
-            out.push(e.path().to_path_buf());
-            it.skip_current_dir();
-        }
-    }
-    out
-}
-
 /// Move an orphaned store unit out of the way of a new project with the same name.
-fn clear_name(store: &Store, name: &str, live_uuid: Option<crate::btrfs::Uuid>) -> Result<()> {
+fn clear_name(store: &Store, name: &str, live_uuid: Option<crate::btrfs::Uuid>, lock_timeout: Duration) -> Result<()> {
     let unit = store.unit(name);
     let Some(rec) = unit.read_record()? else {
         return Ok(());
@@ -70,10 +60,10 @@ fn clear_name(store: &Store, name: &str, live_uuid: Option<crate::btrfs::Uuid>) 
     }
     tracing::warn!("store entry for a previous {name} (uuid {}) moved to {new_name}", rec.uuid);
     if !store.dry_run {
-        std::fs::rename(&unit.dir, &target.dir)?;
+        let moved = unit.lock(lock_timeout)?.rename_to(target)?;
         let mut rec = rec;
         rec.name = new_name;
-        target.write_record(&rec)?;
+        moved.write_record(&rec)?;
     }
     Ok(())
 }
@@ -111,7 +101,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
                 return Err(refused(format!("leftover {} exists; run `bpm doctor --fix`", leftover.display())));
             }
         }
-        let nested = nested_subvolumes(ctx, &path);
+        let nested = walk::nested_subvolumes(&path, &|p, i| ctx.is_subvol(p, i))?;
         if !nested.is_empty() {
             let list: Vec<String> = nested.iter().map(|p| p.display().to_string()).collect();
             return Err(refused(format!(
@@ -150,7 +140,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
             );
         }
     }
-    clear_name(&store, name, live_uuid)?;
+    clear_name(&store, name, live_uuid, ctx.cfg.global.lock_timeout)?;
     let owner = (md.uid(), md.gid());
     hooks::run(
         ctx,
@@ -165,7 +155,11 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
         },
     )?;
     if ctx.opts.dry_run {
-        tracing::info!("[dry-run] adopt {} (banlist: {})", path.display(), eff.banlist.join(", "));
+        tracing::info!(
+            "[dry-run] adopt {} (banlist: {})",
+            path.display(),
+            eff.banlist.iter().map(|b| b.as_str()).collect::<Vec<_>>().join(", ")
+        );
         return Ok(AdoptReport {
             name: name.into(),
             path,
@@ -175,14 +169,17 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
             nested: vec![],
             snapshot: 0,
             stage: "active".into(),
+            leftover: None,
         });
     }
 
-    let unit = store.unit(name);
-    unit.ensure_dir()?;
+    let unit = store.unit(name).lock(ctx.cfg.global.lock_timeout)?;
     let mut journal = Journal::begin(&unit.dir, "adopt", &[("path", path.display().to_string())], false)?;
     let keep_build = o.keep_build.unwrap_or(eff.policy.keep_build_on_adopt);
-    let started = ctx.now();
+    // compared with file timestamps, so the real clock
+    let started = jiff::Timestamp::now();
+    let banned_paths = eff.banlist_paths();
+    let mut copied: Option<walk::TreeStats> = None;
     let mut nested_made = Vec::new();
 
     if !is_sub {
@@ -192,7 +189,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
             copy_owner_mode(&md, &tmp)?;
             super::xattr::copy_xattrs(&path, &tmp)?;
             journal.step(2)?;
-            let banned_top: Vec<&str> = eff.banlist.iter().filter(|b| !b.contains('/')).map(String::as_str).collect();
+            let banned_top: Vec<&str> = eff.banlist.iter().filter(|b| b.is_top_level()).map(|b| b.as_str()).collect();
             let mut entries: Vec<_> = std::fs::read_dir(&path)?.flatten().collect();
             entries.sort_by_key(|e| e.file_name());
             for e in entries {
@@ -205,24 +202,33 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
                 }
                 cp_a(&e.path(), &tmp.join(&fname), ctx.reflink)?;
             }
-            for rel in eff.banlist.iter().filter(|b| b.contains('/')) {
-                let p = tmp.join(rel);
-                if p.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) {
-                    std::fs::remove_dir_all(&p)?;
+            for rel in eff.banlist.iter().filter(|b| !b.is_top_level()) {
+                // a symlinked parent was copied as a symlink: never delete through it
+                let Ok(p) = rel.under(&tmp) else {
+                    tracing::warn!(
+                        "{name}: banned path {rel} has a symlinked or non-directory parent; left in snapshots"
+                    );
+                    continue;
+                };
+                if p.symlink_metadata().is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink()) {
+                    ctx.fs.remove_dir_all(&p)?;
                 }
             }
             journal.step(3)?;
             let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
-            let exclude = eff.banlist_paths();
+            let exclude = banned_paths.clone();
             let a = walk::tree_stats(&path, &probe, &exclude, &[], Duration::from_secs(24 * 3600))?;
             let b = walk::tree_stats(&tmp, &probe, &exclude, &[], Duration::from_secs(24 * 3600))?;
-            let counts = |s: &walk::TreeStats| (s.files, s.dirs, s.symlinks, s.others, s.bytes);
+            // path bytes: a hardlink between two top-level entries becomes two files in the copy
             if counts(&a) != counts(&b) {
                 bail!(
                     "verification failed: source {:?} vs copy {:?} (files, dirs, symlinks, others, bytes)",
                     counts(&a),
                     counts(&b)
                 );
+            }
+            if a.bytes != a.path_bytes {
+                tracing::warn!("{name}: hardlinks between top-level entries are copied as separate files");
             }
             if o.verify_paths {
                 let ia = walk::tree_index(&path, &probe)?;
@@ -237,17 +243,17 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
                     bail!("verification failed: path listing differs between {} and its copy", path.display());
                 }
             }
-            if let Some(newest) = a.newest_mtime {
-                if newest > started {
-                    bail!("{} was modified during adoption; retry when idle", path.display());
-                }
+            if a.newest_change.is_some_and(|c| c > started) {
+                bail!("{} was modified during adoption; retry when idle", path.display());
             }
+            copied = Some(b);
             journal.step(4)?;
-            let mut banned: Vec<&String> = eff.banlist.iter().collect();
-            banned.sort_by_key(|b| b.matches('/').count());
+            let mut banned: Vec<&RelPath> = eff.banlist.iter().collect();
+            banned.sort_by_key(|b| b.as_str().matches('/').count());
             for rel in banned {
-                let src = path.join(rel);
-                let dst = tmp.join(rel);
+                let (Ok(src), Ok(dst)) = (rel.under(&path), rel.under(&tmp)) else {
+                    continue;
+                };
                 let Ok(smd) = std::fs::symlink_metadata(&src) else {
                     continue;
                 };
@@ -263,9 +269,28 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
                     cp_a(&src, &dst, ctx.reflink)?;
                 }
                 let _ = super::xattr::copy_times(&src, &dst);
-                nested_made.push(rel.clone());
+                nested_made.push(rel.to_string());
             }
             super::xattr::copy_times(&path, &tmp)?;
+            // last check before the swap: step 4 can take minutes for large build directories
+            let writers = proc::writers_under(&path);
+            if !writers.is_empty() && !o.force {
+                bail!(
+                    "files opened for writing under {} during adoption: {}",
+                    path.display(),
+                    proc::describe(&writers)
+                );
+            }
+            if o.require_unused {
+                let users = proc::open_under(&path);
+                if !users.is_empty() {
+                    bail!("{} came into use during adoption: {}", path.display(), proc::describe(&users));
+                }
+            }
+            let again = walk::tree_stats(&path, &probe, &banned_paths, &[], Duration::from_secs(24 * 3600))?;
+            if again.newest_change.is_some_and(|c| c > started) {
+                bail!("{} was modified during adoption; retry when idle", path.display());
+            }
             Ok(())
         })();
         if let Err(e) = copy {
@@ -274,15 +299,15 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
             return Err(e.context(format!("adopt {name}: copy into new subvolume failed; original untouched")));
         }
         journal.step(5)?;
-        rename_exchange(&path, &tmp).with_context(|| format!("swap {} into place", path.display()))?;
-        std::fs::rename(&tmp, &old)?;
+        ctx.fs.rename_exchange(&path, &tmp).with_context(|| format!("swap {} into place", path.display()))?;
+        ctx.fs.rename(&tmp, &old)?;
     }
 
     journal.step(6)?;
     let info = ctx.btrfs.subvol_info(&path)?;
     let record = ProjectRecord::new(name, &path, info.uuid, owner.0, owner.1, ctx.now());
     unit.write_record(&record)?;
-    let pref = ProjectRef { root: root.clone(), store: store.clone(), unit: unit.clone(), record: record.clone() };
+    let pref = ProjectRef { root: root.clone(), store: store.clone(), unit: (*unit).clone(), record: record.clone() };
     let mut st = ProjectState::default();
     st.banlist_seen.extend(nested_made.iter().cloned());
     let ban = super::banlist::enforce_cheap(ctx, &path, &eff, &mut st, owner, true)?;
@@ -295,12 +320,19 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
     let mut opts = SnapOpts::new(SnapshotKind::Adopt, if is_sub { "registered existing subvolume" } else { "adopted" });
     opts.stats_budget = eff.policy.snapshot.stats_budget;
     let meta = snapshot::take(ctx, &target, &opts)?;
-    init_state(ctx, &mut st, &eff, &record, &meta, &path)?;
+    let last_change = meta.stats.as_ref().and_then(|s| s.newest_mtime).unwrap_or(ctx.now());
+    super::observe::init_new_live(ctx, &eff, &mut st, &meta, &path, last_change)?;
     unit.write_state(&st)?;
 
     journal.step(7)?;
+    let mut leftover = None;
     if !is_sub {
-        std::fs::remove_dir_all(&old).with_context(|| format!("remove old directory {}", old.display()))?;
+        // writes that reached the original after the checks above (a shell whose working
+        // directory is inside) exist only here
+        let expect = Expect::Tree { stats: copied, not_after: started, exclude: banned_paths.clone() };
+        if let Outcome::Kept(p) = retire::retire(ctx, &old, &expect, &[], "adopt")? {
+            leftover = Some(p);
+        }
     }
     journal.finish()?;
     let (files, bytes) = meta.stats.as_ref().map(|s| (s.files, s.bytes)).unwrap_or((0, 0));
@@ -326,32 +358,6 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
         nested: nested_made,
         snapshot: meta.id,
         stage: st.stage.to_string(),
+        leftover,
     })
-}
-
-/// Fresh state after adoption or project recreation.
-pub fn init_state(
-    ctx: &Ctx,
-    st: &mut ProjectState,
-    eff: &EffectiveConfig,
-    record: &ProjectRecord,
-    meta: &crate::store::SnapshotMeta,
-    live: &Path,
-) -> Result<()> {
-    let now = ctx.now();
-    ctx.btrfs.sync(live)?;
-    let info = ctx.btrfs.subvol_info(live)?;
-    st.snap_ctransid = meta.source_ctransid;
-    st.tool_ctransid = info.ctransid;
-    st.last_snapshot_at = Some(meta.created);
-    if let Some(s) = meta.complete_stats() {
-        st.ref_stats = Some(shrink::reset(s, meta.id));
-        st.last_stats_at = Some(meta.created);
-    }
-    let last_change = meta.stats.as_ref().and_then(|s| s.newest_mtime).map(|t| t.min(now)).unwrap_or(now);
-    st.last_change_at = Some(last_change);
-    let stage = lifecycle::stage_for_idle(age(now, last_change), &eff.policy.lifecycle);
-    st.stage = stage;
-    st.stage_since = Some(record.adopted);
-    Ok(())
 }

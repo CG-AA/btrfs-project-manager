@@ -1,6 +1,7 @@
 //! Collapse a project to a single snapshot, and recompress its live tree at a higher zstd level.
 
 use super::Target;
+use super::observe::{self, Walk};
 use super::snapshot::{self, DeleteMode, SnapOpts};
 use crate::btrfs::DefragOpts;
 use crate::config::EffectiveConfig;
@@ -9,11 +10,13 @@ use crate::hooks::{self, HookCtx, HookEvent};
 use crate::policy::{change, thin};
 use crate::project::ProjectRef;
 use crate::store::journal::Journal;
-use crate::store::{ProjectState, RecompressRecord, SnapshotKind, SnapshotMeta, newest};
+use crate::store::{LockedUnit, ProjectState, RecompressRecord, SnapshotKind, SnapshotMeta, newest};
+use crate::util::walk::{self, EntryInfo, EntryKind};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -26,6 +29,7 @@ pub struct CollapseReport {
 /// Ensure the newest snapshot equals live, then delete every policy-deletable older snapshot.
 pub fn collapse(
     ctx: &Ctx,
+    lu: &LockedUnit,
     pref: &ProjectRef,
     eff: &EffectiveConfig,
     st: &mut ProjectState,
@@ -36,23 +40,43 @@ pub fn collapse(
         return Ok(report);
     }
     let target = Target::for_project(pref, eff);
+    let now = ctx.now();
+    ctx.btrfs.sync(pref.path())?;
     let live = ctx.btrfs.subvol_info(pref.path())?;
-    let needs_fresh = newest(snaps).is_none_or(|n| !change::identical(&live, n) || n.complete_stats().is_none());
-    if needs_fresh {
-        let mut o = SnapOpts::new(SnapshotKind::Collapse, "collapse");
-        o.stats_budget = eff.policy.snapshot.stats_budget;
-        let m = snapshot::take(ctx, &target, &o)?;
-        st.snap_ctransid = m.source_ctransid;
-        st.last_snapshot_at = Some(m.created);
-        report.new_snapshot = Some(m.id);
-        snaps.push(m.clone());
-        if super::guard::apply(ctx, &target, eff, st, snaps, &m) {
-            report.froze = true;
-            return Ok(report);
+    observe::note_live(st, &live, now);
+    match newest(snaps).cloned() {
+        Some(n) if change::identical(&live, &n) => {
+            // the newest snapshot already holds this state: count it if it was taken without stats
+            if n.stats.is_none() {
+                let mut n = n;
+                snapshot::count_stats(ctx, lu, &target, &mut n, eff.policy.snapshot.stats_budget)?;
+                if let Some(slot) = snaps.iter_mut().find(|m| m.id == n.id) {
+                    *slot = n;
+                }
+            }
+        }
+        _ => {
+            let mut o = SnapOpts::new(SnapshotKind::Collapse, "collapse");
+            o.stats_budget = eff.policy.snapshot.stats_budget;
+            let m = snapshot::take(ctx, &target, &o)?;
+            observe::note_snapshot(st, &m);
+            report.new_snapshot = Some(m.id);
+            snaps.push(m);
         }
     }
+    if observe::evaluate_guard(ctx, lu, &target, eff, st, snaps, now, Walk::Never) {
+        report.froze = true;
+        return Ok(report);
+    }
     if newest(snaps).is_none_or(|n| n.complete_stats().is_none()) {
-        tracing::warn!("{}: newest snapshot has incomplete stats; not collapsing", pref.name());
+        tracing::warn!(
+            "{}: counting the newest snapshot exceeded snapshot.stats_budget; not collapsing until the project changes",
+            pref.name()
+        );
+        st.collapse_incomplete_ctransid = Some(live.ctransid);
+        return Ok(report);
+    }
+    if !observe::thin_allowed(st, snaps) {
         return Ok(report);
     }
     let ids = thin::collapse_deletions(snaps, ctx.now(), eff.policy.thin.safety_ttl, st.frozen.as_ref());
@@ -60,7 +84,7 @@ pub fn collapse(
         let Some(meta) = snaps.iter().find(|m| m.id == id).cloned() else {
             continue;
         };
-        match snapshot::delete(ctx, &pref.unit, &pref.record, snaps, &meta, DeleteMode::Policy, "collapse") {
+        match snapshot::delete(ctx, lu, &pref.record, snaps, &meta, DeleteMode::Policy, "collapse") {
             Ok(()) => {
                 report.deleted.push(id);
                 snaps.retain(|m| m.id != id);
@@ -103,12 +127,12 @@ fn zstd_len(data: &[u8], level: u8) -> Result<usize> {
 }
 
 /// Estimate the gain of recompressing at `level` over zstd:1 from a sample of files.
-pub fn sample_gain(ctx: &Ctx, live: &Path, exclude: &[std::path::PathBuf], level: u8) -> Result<f64> {
+pub fn sample_gain(ctx: &Ctx, live: &Path, exclude: &[PathBuf], level: u8) -> Result<f64> {
     let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
     let mut files = Vec::new();
     let walker = walkdir::WalkDir::new(live).follow_links(false).into_iter().filter_entry(|e| {
         let rel = e.path().strip_prefix(live).unwrap_or(e.path());
-        !(e.depth() > 0 && (exclude.iter().any(|x| x == rel) || crate::util::walk::entry_is_subvol(e, &probe)))
+        !(e.depth() > 0 && (exclude.iter().any(|x| x == rel) || walk::entry_is_subvol(e, &probe)))
     });
     for e in walker.flatten().filter(|e| e.file_type().is_file()).take(20_000) {
         if e.metadata().map(|m| m.len() >= 4096).unwrap_or(false) {
@@ -132,6 +156,25 @@ pub fn sample_gain(ctx: &Ctx, live: &Path, exclude: &[std::path::PathBuf], level
     Ok(if base == 0 { 0.0 } else { 1.0 - high as f64 / base as f64 })
 }
 
+/// What a defragment must not change about an entry: kind, size, mtime, mode.
+type EntryKey = (EntryKind, u64, Option<i128>, u32);
+
+/// Listing keys of a snapshot tree, in path order.
+///
+/// The mtime of an empty directory is left out: a nested subvolume's placeholder is an empty
+/// directory whose mtime is the moment the kernel instantiated its inode, so it differs between
+/// walks. Non-empty directories keep theirs: replacing a file by one with the same size, mode and
+/// mtime (`cp -p`, `rsync -a`, `tar -x`) shows only in the parent directory's mtime.
+fn listing_keys(idx: BTreeMap<PathBuf, EntryInfo>) -> impl Iterator<Item = (PathBuf, EntryKey)> {
+    let mut it = idx.into_iter().peekable();
+    std::iter::from_fn(move || {
+        let (path, e) = it.next()?;
+        let has_children = it.peek().is_some_and(|(next, _)| next.starts_with(&path));
+        let mtime = (e.kind != EntryKind::Dir || has_children).then_some(e.mtime_ns);
+        Some((path, (e.kind, e.size, mtime, e.mode)))
+    })
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct RecompressReport {
     pub done: bool,
@@ -143,8 +186,10 @@ pub struct RecompressReport {
     pub free_after: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn recompress(
     ctx: &Ctx,
+    lu: &LockedUnit,
     pref: &ProjectRef,
     eff: &EffectiveConfig,
     st: &mut ProjectState,
@@ -170,7 +215,7 @@ pub fn recompress(
         skip(&mut report, "project is frozen".into());
         return Ok(report);
     }
-    let c = collapse(ctx, pref, eff, st, snaps)?;
+    let c = collapse(ctx, lu, pref, eff, st, snaps)?;
     report.deleted.extend(c.deleted);
     if c.froze {
         skip(&mut report, "shrink guard froze the project".into());
@@ -194,6 +239,7 @@ pub fn recompress(
         skip(&mut report, why);
         return Ok(report);
     }
+    ctx.btrfs.sync(&live)?;
     let live_info = ctx.btrfs.subvol_info(&live)?;
     if !force {
         let gain = sample_gain(ctx, &live, &eff.stats_exclude(), level)?;
@@ -238,19 +284,55 @@ pub fn recompress(
     let mut o = SnapOpts::new(SnapshotKind::Collapse, format!("recompress zstd:{level}"));
     o.stats_budget = eff.policy.snapshot.stats_budget;
     let m = snapshot::take(ctx, &target, &o)?;
-    st.snap_ctransid = m.source_ctransid;
-    st.last_snapshot_at = Some(m.created);
+    observe::note_snapshot(st, &m);
     report.new_snapshot = Some(m.id);
     snaps.push(m.clone());
-    if super::guard::apply(ctx, &target, eff, st, snaps, &m) {
+    if observe::evaluate_guard(ctx, lu, &target, eff, st, snaps, ctx.now(), Walk::Never) {
         journal.finish()?;
         skip(&mut report, "shrink guard froze the project after defragment".into());
+        return Ok(report);
+    }
+    // Defragment rewrites extents, not names, sizes or times. Anything else that differs between
+    // the snapshots before and after was changed by someone else during the defragment: keep the
+    // old snapshot (the only copy of the previous state) and count the change as activity.
+    let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
+    // the root's own mtime is not in the index: it is what a replacement at the top level changes
+    let index = |id: u64| -> Result<(i128, BTreeMap<PathBuf, EntryInfo>)> {
+        use std::os::unix::fs::MetadataExt;
+        let path = pref.unit.snapshot_path(id);
+        let md = std::fs::symlink_metadata(&path)?;
+        Ok((walk::nanos(md.mtime(), md.mtime_nsec()), walk::tree_index(&path, &probe)?))
+    };
+    let (root_before, before) = index(old.id)?;
+    let (root_after, after_idx) = index(m.id)?;
+    let untouched = root_before == root_after && listing_keys(before).eq(listing_keys(after_idx));
+    ctx.btrfs.sync(&live)?;
+    let after = ctx.btrfs.subvol_info(&live)?;
+    if !untouched {
+        tracing::warn!(
+            "{}: the project changed during recompression; snapshot #{} is kept and the change counts as activity",
+            pref.name(),
+            old.id
+        );
+        observe::note_live(st, &after, ctx.now());
+        report.free_after = ctx.free_bytes(&live)?;
+        st.recompress = Some(RecompressRecord {
+            at: ctx.now(),
+            level,
+            ctransid: after.ctransid,
+            bytes_before: report.free_before,
+            bytes_after: report.free_after,
+            skipped: None,
+        });
+        journal.finish()?;
+        report.done = true;
+        hooks::run(ctx, HookEvent::PostRecompress, &hctx)?;
         return Ok(report);
     }
     if !old.hold && old.kind.class() != crate::store::KindClass::Keep {
         match snapshot::delete(
             ctx,
-            &pref.unit,
+            lu,
             &pref.record,
             snaps,
             &old,
@@ -270,9 +352,7 @@ pub fn recompress(
             old.id
         );
     }
-    ctx.btrfs.sync(&live)?;
-    let after = ctx.btrfs.subvol_info(&live)?;
-    st.tool_ctransid = after.ctransid;
+    observe::note_tool_change(st, &live_info, &after, ctx.now());
     report.free_after = ctx.free_bytes(&live)?;
     st.recompress = Some(RecompressRecord {
         at: ctx.now(),

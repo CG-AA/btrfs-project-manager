@@ -3,13 +3,15 @@
 use crate::cli::DoctorArgs;
 use crate::ctx::Ctx;
 use crate::mechanics::adopt;
+use crate::mechanics::retire::{self, Expect};
 use crate::output::{Table, emit};
-use crate::project;
+use crate::project::{self, Leftover};
 use crate::store::journal::Journal;
 use crate::store::{SnapshotKind, SnapshotMeta, Stage, Unit};
+use crate::util::relpath::RelPath;
 use anyhow::Result;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Serialize, Clone, Debug)]
@@ -42,6 +44,19 @@ impl Doc<'_> {
     /// Record a fixable problem and run `f` when --fix was given.
     fn fixable(&mut self, level: &'static str, what: String, fix: String, f: impl FnOnce() -> Result<()>) {
         let mut fixed = false;
+        if self.fix && self.ctx.opts.dry_run {
+            // the fix runs against the dry-run backends, so it only logs what it would do
+            if let Err(e) = f() {
+                self.out.push(Finding {
+                    level: "error",
+                    what: format!("[dry-run] fix would fail for {what}: {e:#}"),
+                    fix: None,
+                    fixed: false,
+                });
+            }
+            self.out.push(Finding { level, what, fix: Some(format!("[dry-run] would run: {fix}")), fixed: false });
+            return;
+        }
         if self.fix {
             match f() {
                 Ok(()) => fixed = true,
@@ -84,7 +99,34 @@ fn snapper_configs_for(root: &Path) -> Vec<(String, bool)> {
 }
 
 pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
-    let mut d = Doc { ctx, fix: a.fix, out: vec![] };
+    let out = findings(ctx, a.fix);
+    let problems = out.iter().filter(|f| matches!(f.level, "warn" | "error") && !f.fixed).count();
+    emit(ctx, &out, || {
+        let mut t = Table::new(&["", "FINDING", "FIX"]);
+        for f in &out {
+            let mark = match (f.level, f.fixed) {
+                (_, true) => "fixed",
+                ("ok", _) => "ok",
+                ("info", _) => "info",
+                ("warn", _) => "WARN",
+                _ => "ERROR",
+            };
+            t.row(vec![mark.into(), f.what.clone(), f.fix.clone().unwrap_or_default()]);
+        }
+        let mut s = t.render();
+        if problems > 0 && !a.fix && out.iter().any(|f| f.fix.as_deref().is_some_and(|x| x.starts_with("doctor --fix")))
+        {
+            s += "\nrun `bpm doctor --fix` to repair the items marked `doctor --fix`\n";
+        }
+        s
+    });
+    Ok(())
+}
+
+/// Run every check, applying repairs when `fix`. Separate from rendering so that tests and
+/// callers that only want the results do not have to parse the table.
+pub fn findings(ctx: &Ctx, fix: bool) -> Vec<Finding> {
+    let mut d = Doc { ctx, fix, out: vec![] };
     match &ctx.cfg_path {
         Some(p) => d.ok(format!("config {}", p.display())),
         None => d.warn("no config file; using the embedded default", Some("bpm setup".into())),
@@ -103,18 +145,20 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
             d.error(format!("{tool} not found"), None);
         }
     }
-    let timer = Command::new("systemctl")
-        .args(["is-enabled", "bpm.timer"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    if timer == "enabled" {
-        d.ok("bpm.timer enabled");
-    } else {
-        d.warn(
-            format!("bpm.timer is {}", if timer.is_empty() { "not installed".into() } else { timer }),
-            Some("bpm setup".into()),
-        );
+    for unit in super::setup::TIMERS {
+        let state = Command::new("systemctl")
+            .args(["is-enabled", unit])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if state == "enabled" {
+            d.ok(format!("{unit} enabled"));
+        } else {
+            d.warn(
+                format!("{unit} is {}", if state.is_empty() { "not installed".into() } else { state }),
+                Some("bpm setup".into()),
+            );
+        }
     }
     for root in ctx.roots() {
         let store = ctx.store(&root);
@@ -215,7 +259,11 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
             if let Some(fr) = &st.frozen {
                 d.warn(
                     format!("{}: FROZEN: {}", f.name, fr.reasons.join("; ")),
-                    Some(format!("bpm status {0}; then bpm rollback {0} held or bpm unfreeze {0}", f.name)),
+                    Some(format!(
+                        "bpm status {0}; then bpm rollback {0} {1} or bpm unfreeze {0}",
+                        f.name,
+                        fr.ref_snap.map(|id| id.to_string()).unwrap_or_else(|| "held".into())
+                    )),
                 );
             }
             if let Some(e) = &st.last_error {
@@ -223,6 +271,23 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
             }
             if let Ok(eff) = project::effective(ctx, &root, &f.name, &f.path) {
                 check_nested_leftovers(&mut d, &f.path, &eff.banlist);
+                check_kept_leftovers(&mut d, &f.path, &eff.banlist_paths());
+                if !eff.ignored_project_keys.is_empty() {
+                    d.warn(
+                        format!(
+                            "{}: .bpm.toml sets {}, which only the admin config may change; ignored",
+                            f.name,
+                            eff.ignored_project_keys.join(", ")
+                        ),
+                        Some("set it under [projects.\"name\"] in the admin config".into()),
+                    );
+                }
+                if !eff.policy.snapshot.stats {
+                    d.warn(
+                        format!("{}: snapshot.stats = false, so the shrink guard cannot see deletions", f.name),
+                        Some("set snapshot.stats = true to have wipes freeze cleanup".into()),
+                    );
+                }
                 for rel in st.pending_convert.keys() {
                     d.info(format!(
                         "{}: banned directory {rel} is a plain directory (included in snapshots until converted)",
@@ -233,29 +298,34 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
         }
     }
     check_claude_hook(&mut d);
-    let problems = d.out.iter().filter(|f| matches!(f.level, "warn" | "error") && !f.fixed).count();
-    emit(ctx, &d.out, || {
-        let mut t = Table::new(&["", "FINDING", "FIX"]);
-        for f in &d.out {
-            let mark = match (f.level, f.fixed) {
-                (_, true) => "fixed",
-                ("ok", _) => "ok",
-                ("info", _) => "info",
-                ("warn", _) => "WARN",
-                _ => "ERROR",
-            };
-            t.row(vec![mark.into(), f.what.clone(), f.fix.clone().unwrap_or_default()]);
-        }
-        let mut s = t.render();
-        if problems > 0
-            && !a.fix
-            && d.out.iter().any(|f| f.fix.as_deref().is_some_and(|x| x.starts_with("doctor --fix")))
-        {
-            s += "\nrun `bpm doctor --fix` to repair the items marked `doctor --fix`\n";
-        }
-        s
-    });
-    Ok(())
+    check_snap_sudo(&mut d);
+    d.out
+}
+
+/// The original tree left by an adopt interrupted after the swap: delete it only if it matches
+/// the adopt snapshot of the project now at `orig`.
+fn adopt_leftover_expect(
+    ctx: &Ctx,
+    store: &crate::store::Store,
+    root: &crate::config::RootCfg,
+    base: &str,
+) -> Option<Expect<'static>> {
+    let unit = store.unit(base);
+    let rec = unit.read_record().ok()??;
+    let snap =
+        unit.snapshots().ok()?.into_iter().find(|m| m.kind == SnapshotKind::Adopt && rec.owns(Some(m.source_uuid)))?;
+    let eff = project::effective(ctx, root, base, &root.path.join(base)).ok()?;
+    let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
+    let exclude = eff.banlist_paths();
+    let stats = crate::util::walk::tree_stats(
+        &unit.snapshot_path(snap.id),
+        &probe,
+        &exclude,
+        &[],
+        std::time::Duration::from_secs(24 * 3600),
+    )
+    .ok()?;
+    Some(Expect::Tree { stats: Some(stats), not_after: snap.created, exclude })
 }
 
 fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crate::store::Store) {
@@ -266,32 +336,28 @@ fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crat
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
         let path = e.path();
+        let Some(leftover) = Leftover::parse(&name) else { continue };
+        let orig = root.path.join(leftover.base());
         let is_sub = ctx.btrfs.is_subvolume(&path).unwrap_or(false);
-        if let Some(base) = name.strip_suffix(".bpm-tmp") {
-            let orig = root.path.join(base);
-            let orig_sub = ctx.btrfs.is_subvolume(&orig).unwrap_or(false);
-            if is_sub && orig.is_dir() && !orig_sub {
+        let orig_sub = ctx.btrfs.is_subvolume(&orig).unwrap_or(false);
+        match leftover {
+            Leftover::Keep { op, .. } => d.error(
+                format!(
+                    "{}: kept by an interrupted or unverified {op} because it may hold changes that exist nowhere else",
+                    path.display()
+                ),
+                Some(format!("compare with {} (bpm diff), merge by hand, then delete it", orig.display())),
+            ),
+            Leftover::Tmp { .. } if is_sub && orig.is_dir() && !orig_sub => {
                 let p = path.clone();
                 d.fixable(
                     "warn",
                     format!("{}: adopt was interrupted before the swap", path.display()),
-                    "doctor --fix deletes the partial copy".into(),
+                    "doctor --fix deletes the partial copy (the original is untouched)".into(),
                     || ctx.btrfs.delete_subvolume(&p, true),
                 );
-            } else if !is_sub && orig_sub {
-                let p = path.clone();
-                d.fixable(
-                    "warn",
-                    format!("{}: old directory left after adopt swap", path.display()),
-                    "doctor --fix removes it".into(),
-                    || Ok(std::fs::remove_dir_all(&p)?),
-                );
-            } else {
-                d.error(format!("{}: unexpected leftover; inspect manually", path.display()), None);
             }
-        } else if let Some(base) = name.strip_suffix(".bpm-old") {
-            let orig = root.path.join(base);
-            if ctx.btrfs.is_subvolume(&orig).unwrap_or(false) {
+            Leftover::Tmp { ref base } | Leftover::Old { ref base } if !is_sub && orig_sub => {
                 let registered = store.unit(base).read_record().ok().flatten().is_some();
                 let p = path.clone();
                 let (root_c, base_s) = (root.clone(), base.to_string());
@@ -302,7 +368,7 @@ fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crat
                         path.display(),
                         if registered { "" } else { " or registration" }
                     ),
-                    "doctor --fix registers the project and removes the old copy".into(),
+                    "doctor --fix registers the project, then removes the old copy if it matches the adopt snapshot (otherwise keeps it as .bpm-keep-adopt-*)".into(),
                     || {
                         if !registered {
                             adopt::adopt(
@@ -317,71 +383,68 @@ fn check_root_leftovers(d: &mut Doc, root: &crate::config::RootCfg, store: &crat
                                 },
                             )?;
                         }
-                        Ok(std::fs::remove_dir_all(&p)?)
+                        match adopt_leftover_expect(ctx, store, &root_c, &base_s) {
+                            Some(expect) => retire::retire(ctx, &p, &expect, &[], "adopt").map(|_| ()),
+                            None => {
+                                retire::retire(ctx, &p, &Expect::Tree { stats: None, not_after: jiff::Timestamp::MIN, exclude: vec![] }, &[], "adopt")
+                                    .map(|_| ())
+                            }
+                        }
                     },
                 );
-            } else {
-                d.error(
-                    format!(
-                        "{}: leftover next to a non-subvolume {}; inspect manually",
-                        path.display(),
-                        orig.display()
-                    ),
-                    None,
-                );
             }
-        } else if let Some(idx) = name.find(".bpm-rollback-") {
-            let base = &name[..idx];
-            let orig = root.path.join(base);
-            if !orig.exists() {
+            Leftover::Tmp { .. } | Leftover::Old { .. } => {
+                d.error(format!("{}: unexpected leftover; inspect manually", path.display()), None);
+            }
+            Leftover::Rollback { .. } if !orig.exists() => {
                 let (p, o) = (path.clone(), orig.clone());
                 d.fixable(
                     "error",
                     format!("{}: rollback was interrupted before the new tree existed", path.display()),
                     format!("doctor --fix renames it back to {}", orig.display()),
-                    || Ok(std::fs::rename(&p, &o)?),
+                    || ctx.fs.rename(&p, &o),
                 );
-            } else {
-                let nested = has_nested(ctx, &path);
-                if nested {
-                    d.error(format!("{}: rollback leftover still contains nested subvolumes; move them into {} or delete with `btrfs subvolume delete -R`", path.display(), orig.display()), None);
-                } else {
-                    let p = path.clone();
-                    d.fixable(
-                        "warn",
-                        format!(
-                            "{}: pre-rollback tree left behind (it is also saved as a rollback snapshot)",
-                            path.display()
-                        ),
-                        "doctor --fix deletes it".into(),
-                        || ctx.btrfs.delete_subvolume(&p, false),
-                    );
-                }
+            }
+            Leftover::Rollback { ref base } => {
+                // deletable only when a rollback snapshot of exactly this tree exists
+                let uuid = ctx.btrfs.subvol_info(&path).ok().map(|i| i.uuid);
+                let safety = store
+                    .unit(base)
+                    .snapshots()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|m| Some(m.source_uuid) == uuid && m.kind == SnapshotKind::Rollback)
+                    .max_by_key(|m| m.id);
+                let p = path.clone();
+                d.fixable(
+                    "warn",
+                    format!(
+                        "{}: pre-rollback tree left behind{}",
+                        path.display(),
+                        if safety.is_some() { " (it is also saved as a rollback snapshot)" } else { "" }
+                    ),
+                    "doctor --fix deletes it if it is identical to its rollback snapshot, otherwise keeps it as .bpm-keep-rollback-*".into(),
+                    move || match &safety {
+                        Some(m) => retire::retire(ctx, &p, &Expect::Snapshot { kept: m }, &[], "rollback").map(|_| ()),
+                        None => retire::retire(ctx, &p, &Expect::Tree { stats: None, not_after: jiff::Timestamp::MIN, exclude: vec![] }, &[], "rollback").map(|_| ()),
+                    },
+                );
             }
         }
     }
 }
 
-fn has_nested(ctx: &Ctx, dir: &Path) -> bool {
-    walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .min_depth(1)
-        .into_iter()
-        .flatten()
-        .any(|e| crate::util::walk::entry_is_subvol(&e, &|p, i| ctx.is_subvol(p, i)))
-}
-
-fn check_nested_leftovers(d: &mut Doc, live: &Path, banlist: &[String]) {
+fn check_nested_leftovers(d: &mut Doc, live: &Path, banlist: &[RelPath]) {
     let ctx = d.ctx;
     for rel in banlist {
-        let full = live.join(rel);
+        let Ok(full) = rel.under(live) else { continue };
+        let full_sub = ctx.btrfs.is_subvolume(&full).unwrap_or(false);
         for suffix in [".bpm-tmp", ".bpm-old"] {
             let p = crate::util::fs::sibling(&full, suffix);
             if p.symlink_metadata().is_err() {
                 continue;
             }
             let p_sub = ctx.btrfs.is_subvolume(&p).unwrap_or(false);
-            let full_sub = ctx.btrfs.is_subvolume(&full).unwrap_or(false);
             let pc = p.clone();
             if p_sub && !full_sub {
                 d.fixable(
@@ -391,14 +454,41 @@ fn check_nested_leftovers(d: &mut Doc, live: &Path, banlist: &[String]) {
                     || ctx.btrfs.delete_subvolume(&pc, true),
                 );
             } else if !p_sub && full_sub {
+                // unchanged since the nested subvolume was created: its contents were copied there
+                let created = ctx.btrfs.subvol_info(&full).ok().and_then(|i| i.otime).unwrap_or(jiff::Timestamp::MIN);
                 d.fixable(
                     "warn",
                     format!("{}: old build directory left after conversion", p.display()),
-                    "doctor --fix removes it".into(),
-                    || Ok(std::fs::remove_dir_all(&pc)?),
+                    "doctor --fix removes it if unchanged since the conversion, otherwise keeps it as .bpm-keep-convert-*".into(),
+                    move || {
+                        retire::retire(ctx, &pc, &Expect::Tree { stats: None, not_after: created, exclude: vec![] }, &[], "convert")
+                            .map(|_| ())
+                    },
                 );
             }
         }
+    }
+}
+
+/// Trees and files `retire` kept anywhere in the project because it could not prove they were
+/// already saved. They may hold the only copy of something, so doctor only reports them.
+fn check_kept_leftovers(d: &mut Doc, live: &Path, exclude: &[PathBuf]) {
+    let ctx = d.ctx;
+    let (found, complete) = crate::util::walk::find_marker(
+        live,
+        &|p, i| ctx.is_subvol(p, i),
+        exclude,
+        retire::KEEP_MARKER,
+        std::time::Duration::from_secs(30),
+    );
+    for p in found {
+        d.error(
+            format!("{}: kept because it may hold changes that exist nowhere else", p.display()),
+            Some("inspect, merge by hand, then delete it".into()),
+        );
+    }
+    if !complete {
+        d.info(format!("{}: took too long to scan for kept leftovers; some may be unreported", live.display()));
     }
 }
 
@@ -418,7 +508,7 @@ fn check_unit(d: &mut Doc, unit: &Unit) {
                     j.data.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ")
                 ),
                 "doctor --fix clears the journal after the leftover checks above".into(),
-                || Ok(std::fs::remove_file(Journal::path_in(&dir))?),
+                || ctx.fs.remove_file(&Journal::path_in(&dir)),
             );
         }
     }
@@ -449,6 +539,7 @@ fn check_unit(d: &mut Doc, unit: &Unit) {
 }
 
 fn recover_meta(ctx: &Ctx, unit: &Unit, id: u64, path: &Path) -> Result<()> {
+    let unit = unit.lock(std::time::Duration::ZERO)?;
     let info = ctx.btrfs.subvol_info(path)?;
     let meta = SnapshotMeta {
         format: 1,
@@ -468,7 +559,35 @@ fn recover_meta(ctx: &Ctx, unit: &Unit, id: u64, path: &Path) -> Result<()> {
         stats: None,
         origin: ctx.origin(),
     };
-    unit.write_meta(&unit.snapshot_dir(id), &meta)
+    unit.write_meta_in(&unit.snapshot_dir(id), &meta)
+}
+
+/// As a normal user: can the Claude hook's `sudo -n bpm snap …` run without a password?
+fn check_snap_sudo(d: &mut Doc) {
+    if crate::privilege::is_root() || d.ctx.opts.no_sudo || !d.ctx.cfg.global.sudo {
+        return;
+    }
+    let args: Vec<std::ffi::OsString> = ["snap", "doctor-probe", "--kind", "hook"].iter().map(Into::into).collect();
+    let Ok(probe) = crate::privilege::self_command(&args, d.ctx.opts.config.as_deref(), true) else {
+        return;
+    };
+    // `sudo -n -l <command…>` only checks whether the command is allowed
+    let argv: Vec<std::ffi::OsString> = probe.get_args().map(|a| a.to_os_string()).collect();
+    let allowed = Command::new("sudo")
+        .arg("-n")
+        .arg("-l")
+        .args(argv.iter().skip(2))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if allowed {
+        d.ok("passwordless sudo allows `bpm snap` (hook and wrap snapshots work)");
+    } else {
+        d.warn(
+            "`sudo -n bpm snap …` needs a password: Claude hook and `bpm wrap` snapshots are skipped",
+            Some("see docs/OPERATIONS.md (sudoers line for `bpm snap *`)".into()),
+        );
+    }
 }
 
 fn check_claude_hook(d: &mut Doc) {

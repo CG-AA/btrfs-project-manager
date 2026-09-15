@@ -1,11 +1,13 @@
 //! Keep banned directories (build output, caches) as nested subvolumes so snapshots skip them.
 
+use super::retire::{self, Expect, Outcome};
 use crate::config::{EffectiveConfig, Precreate};
 use crate::ctx::Ctx;
 use crate::error::refused;
 use crate::store::ProjectState;
-use crate::util::fs::{copy_owner_mode, cp_a, dir_is_empty, rename_exchange, set_owner_mode, sibling};
+use crate::util::fs::{copy_owner_mode, cp_a, dir_is_empty, set_owner_mode, sibling};
 use crate::util::proc;
+use crate::util::relpath::RelPath;
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::Path;
@@ -43,16 +45,27 @@ pub fn enforce_cheap(
 ) -> Result<Vec<BanAction>> {
     let now = ctx.now();
     let mut out = Vec::new();
-    st.pending_convert.retain(|k, _| eff.banlist.contains(k));
-    for rel in &eff.banlist {
-        let full = live.join(rel);
+    st.pending_convert.retain(|k, _| eff.is_banned(k));
+    for relpath in &eff.banlist {
+        let rel = &relpath.to_string();
+        let full = match relpath.under(live) {
+            Ok(p) => p,
+            Err(e) => {
+                warn_once(st, format!("banlist-unsafe:{rel}"), now, || {
+                    format!("{}: banned path {rel} left alone: {e}", eff.name)
+                });
+                st.pending_convert.remove(rel);
+                out.push(BanAction::NotADirectory(rel.clone()));
+                continue;
+            }
+        };
         match std::fs::symlink_metadata(&full) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 st.pending_convert.remove(rel);
                 let wanted = match eff.policy.banlist_precreate {
                     Precreate::All => true,
                     Precreate::None => false,
-                    Precreate::Primary => eff.primary_banlist.contains(rel) || st.banlist_seen.contains(rel),
+                    Precreate::Primary => eff.primary_banlist.contains(relpath) || st.banlist_seen.contains(rel),
                 };
                 let parent_ok = full.parent().is_some_and(|p| p.is_dir());
                 if wanted && allow_create && parent_ok {
@@ -84,7 +97,7 @@ pub fn enforce_cheap(
                         out.push(BanAction::Recreated(rel.clone()));
                         continue;
                     }
-                    match std::fs::remove_dir(&full) {
+                    match ctx.fs.remove_dir(&full) {
                         Ok(()) => {
                             ctx.btrfs.create_subvolume(&full)?;
                             copy_owner_mode(&md, &full)?;
@@ -108,7 +121,9 @@ pub fn enforce_cheap(
 
 /// Is a pending conversion safe to run now?
 pub fn ready_to_convert(ctx: &Ctx, live: &Path, rel: &str, eff: &EffectiveConfig) -> bool {
-    let full = live.join(rel);
+    let Some(full) = RelPath::parse(rel).and_then(|r| r.under(live).ok()) else {
+        return false;
+    };
     let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
     full.is_dir()
         && crate::util::walk::is_quiet(&full, &probe, eff.policy.banlist_settle, 5000)
@@ -117,7 +132,7 @@ pub fn ready_to_convert(ctx: &Ctx, live: &Path, rel: &str, eff: &EffectiveConfig
 
 /// Heavy: turn a non-empty plain banned directory into a nested subvolume.
 pub fn convert(ctx: &Ctx, live: &Path, rel: &str, keep_contents: bool, force: bool) -> Result<()> {
-    let full = live.join(rel);
+    let full = RelPath::parse(rel).ok_or_else(|| refused(format!("invalid relative path {rel:?}")))?.under(live)?;
     let tmp = sibling(&full, ".bpm-tmp");
     let old = sibling(&full, ".bpm-old");
     for leftover in [&tmp, &old] {
@@ -140,18 +155,27 @@ pub fn convert(ctx: &Ctx, live: &Path, rel: &str, keep_contents: bool, force: bo
         tracing::info!("[dry-run] convert {} into a nested subvolume", full.display());
         return Ok(());
     }
+    // compared with file timestamps, so the real clock
+    let started = jiff::Timestamp::now();
     ctx.btrfs.create_subvolume(&tmp)?;
     copy_owner_mode(&md, &tmp)?;
+    let mut copied = None;
     if keep_contents {
         if let Err(e) = cp_a(&full, &tmp, ctx.reflink) {
             let _ = ctx.btrfs.delete_subvolume(&tmp, true);
             return Err(e);
         }
+        let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
+        copied =
+            Some(crate::util::walk::tree_stats(&tmp, &probe, &[], &[], std::time::Duration::from_secs(24 * 3600))?);
     }
     let _ = super::xattr::copy_times(&full, &tmp);
-    rename_exchange(&full, &tmp)?;
-    std::fs::rename(&tmp, &old)?;
-    std::fs::remove_dir_all(&old).with_context(|| format!("remove {}", old.display()))?;
+    ctx.fs.rename_exchange(&full, &tmp)?;
+    ctx.fs.rename(&tmp, &old)?;
+    let expect = Expect::Tree { stats: copied, not_after: started, exclude: vec![] };
+    if let Outcome::Kept(k) = retire::retire(ctx, &old, &expect, &[], "convert")? {
+        tracing::warn!("{}: previous contents kept at {}", full.display(), k.display());
+    }
     tracing::info!("converted {} into a nested subvolume", full.display());
     Ok(())
 }

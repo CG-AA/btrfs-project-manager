@@ -19,7 +19,9 @@ Per-project policy is merged key by key, later layers winning:
 
 Banlists are unions: `defaults.banlist` + matched profile banlists + `root.banlist_add` +
 `projects.<name>.banlist_add` + `.bpm.toml` `banlist_add`, minus both `banlist_remove` lists.
-Entries are paths relative to the project root, like `target` or `web/node_modules`.
+Entries are paths relative to the project root, like `target` or `web/node_modules`. bpm never
+follows a symlink in the middle of an entry: if `web` is a symlink, `web/node_modules` is left
+alone (and stays in snapshots). The same applies to paths given to `bpm restore`.
 
 ## `[global]`
 
@@ -46,7 +48,7 @@ Entries are paths relative to the project root, like `target` or `web/node_modul
 |---|---|---|
 | `path` | required | absolute path, ideally a subvolume root |
 | `ignore` | `[]` | top-level names that are never projects (they stay in container snapshots) |
-| `adopt` | `"manual"` (`"auto"` in the default file) | `auto`: tick adopts new top-level directories, one per tick |
+| `adopt` | `"manual"` (`"auto"` in the default file) | `auto`: new top-level directories and subvolumes are adopted, one at a time; one that keeps failing is retried after 1 h, doubling up to a day |
 | `adopt_min_age` | `"15m"` | a new directory must be untouched this long before auto-adoption |
 | `banlist_add` | `[]` | added to every project in this root |
 | `policy` | `{}` | policy overrides for this root |
@@ -75,7 +77,7 @@ Set these under `[defaults]`, `[profiles.X.policy]`, `[root.policy]`, `[projects
 | `snapshot.min_interval` | `"5m"` | minimum spacing of automatic snapshots |
 | `snapshot.stats` | `true` | count files and bytes in new snapshots (needed by the shrink guard) |
 | `snapshot.stats_budget` | `"120s"` | give up counting after this (incomplete stats block collapse and recompress) |
-| `snapshot.stats_min_interval` | `"30m"` | for trees whose count takes over 2 s, count at most this often |
+| `snapshot.stats_min_interval` | `"30m"` | for trees whose count takes over 2 s, count at most this often; a snapshot taken without a count is counted later, and retention waits for that |
 | `thin.keep_all` | `"6h"` | keep every automatic snapshot younger than this |
 | `thin.hourly` | `"48h"` | then the oldest snapshot of each hour |
 | `thin.daily` | `"14d"` | then of each day |
@@ -123,7 +125,7 @@ min_interval = "10m"
 ## `<project>/.bpm.toml`
 
 ```toml
-managed = true                 # false: bpm ignores this project entirely
+managed = true                 # ignored when false (see below); set it in the admin config
 profile = "auto"               # or ["rust", "node"]
 banlist_add = ["out", "data/cache"]
 banlist_remove = ["dist"]
@@ -134,4 +136,10 @@ dormant_after = "30d"
 ```
 
 An agent working in the repository can edit this file, so it cannot change hooks or sudo
-behaviour. Set `global.project_config = false` to ignore these files entirely.
+behaviour, and its `[policy.shrink_guard]` and `[policy.thin]` tables are ignored (with a warning):
+whether deletions freeze cleanup and how long history is kept are set in the admin config, for
+example `[projects."name".policy.thin]`. For the same reason `managed = false` in this file is
+ignored — it would stop snapshots and the guard together — while `managed = true` is honoured,
+since opting in weakens nothing. To stop managing a project, set `managed = false` under
+`[projects."name"]` in the admin config. Set `global.project_config = false` to ignore these files
+entirely.

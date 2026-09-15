@@ -19,9 +19,12 @@ pub fn changed_since(live: &SubvolInfo, newest: Option<&SnapshotMeta>) -> bool {
     newest.is_none_or(|n| !identical(live, n))
 }
 
-/// A content change not caused by bpm itself: resets the idle clock.
+/// A content change since the last observation not caused by bpm itself: resets the idle clock.
+/// Snapshots do not count as observations, so a change captured by a hook or manual snapshot
+/// before the tick saw it is still activity.
 pub fn user_changed(live: &SubvolInfo, st: &ProjectState) -> bool {
-    live.ctransid > st.snap_ctransid.max(st.tool_ctransid)
+    let seen = if st.seen_ctransid == 0 { st.snap_ctransid } else { st.seen_ctransid };
+    live.ctransid > seen.max(st.tool_ctransid)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -96,11 +99,21 @@ mod tests {
 
     #[test]
     fn user_change_ignores_tool_changes() {
-        let mut st = ProjectState { snap_ctransid: 50, ..Default::default() };
+        let mut st = ProjectState { seen_ctransid: 50, ..Default::default() };
         assert!(user_changed(&live(55, 55), &st));
         st.tool_ctransid = 55;
         assert!(!user_changed(&live(55, 55), &st));
         assert!(user_changed(&live(56, 56), &st));
+    }
+
+    #[test]
+    fn user_change_is_measured_from_observation_not_snapshots() {
+        // an old state file: only snap_ctransid is known
+        let st = ProjectState { snap_ctransid: 50, ..Default::default() };
+        assert!(user_changed(&live(55, 55), &st));
+        // a hook snapshot may have captured ctransid 60, but the tick last observed 50
+        let st = ProjectState { snap_ctransid: 60, seen_ctransid: 50, ..Default::default() };
+        assert!(user_changed(&live(60, 60), &st));
     }
 
     #[test]

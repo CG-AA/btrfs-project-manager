@@ -4,7 +4,7 @@ use crate::btrfs::Btrfs;
 use crate::clock::Clock;
 use crate::config::{Config, RootCfg};
 use crate::store::{Origin, Store};
-use crate::util::fs::ReflinkMode;
+use crate::util::fs::{Fs, ReflinkMode};
 use anyhow::Result;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
@@ -56,6 +56,8 @@ pub struct Ctx {
     pub cfg: Config,
     pub cfg_path: Option<PathBuf>,
     pub btrfs: Arc<dyn Btrfs>,
+    /// Destructive file operations (a no-op logger under `--dry-run`).
+    pub fs: Arc<dyn Fs>,
     pub clock: Arc<dyn Clock>,
     pub tz: TimeZone,
     pub opts: Opts,

@@ -9,6 +9,62 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Destructive operations on user trees and store directories. `--dry-run` swaps in `DryRunFs`,
+/// so every caller (including `doctor --fix` closures) is dry-run safe without its own check.
+pub trait Fs: Send + Sync {
+    fn remove_dir_all(&self, path: &Path) -> Result<()>;
+    fn remove_dir(&self, path: &Path) -> Result<()>;
+    fn remove_file(&self, path: &Path) -> Result<()>;
+    /// rename(2) only: fails with EXDEV instead of copying.
+    fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+    fn rename_exchange(&self, a: &Path, b: &Path) -> Result<()>;
+}
+
+pub struct RealFs;
+
+impl Fs for RealFs {
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        fs::remove_dir_all(path).with_context(|| format!("remove {}", path.display()))
+    }
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        fs::remove_dir(path).with_context(|| format!("remove {}", path.display()))
+    }
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        fs::remove_file(path).with_context(|| format!("remove {}", path.display()))
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        rename_strict(from, to)
+    }
+    fn rename_exchange(&self, a: &Path, b: &Path) -> Result<()> {
+        rename_exchange(a, b)
+    }
+}
+
+pub struct DryRunFs;
+
+impl Fs for DryRunFs {
+    fn remove_dir_all(&self, path: &Path) -> Result<()> {
+        tracing::info!("[dry-run] remove {}", path.display());
+        Ok(())
+    }
+    fn remove_dir(&self, path: &Path) -> Result<()> {
+        tracing::info!("[dry-run] rmdir {}", path.display());
+        Ok(())
+    }
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        tracing::info!("[dry-run] remove {}", path.display());
+        Ok(())
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        tracing::info!("[dry-run] rename {} -> {}", from.display(), to.display());
+        Ok(())
+    }
+    fn rename_exchange(&self, a: &Path, b: &Path) -> Result<()> {
+        tracing::info!("[dry-run] swap {} <-> {}", a.display(), b.display());
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReflinkMode {
     /// Production: fail rather than duplicate data.
@@ -66,7 +122,20 @@ pub fn cp_a(src: &Path, dst: &Path, mode: ReflinkMode) -> Result<()> {
         ReflinkMode::Always => "--reflink=always",
         ReflinkMode::Auto => "--reflink=auto",
     };
-    let out = Command::new("cp").arg("-a").arg(reflink).arg("-T").arg(src).arg(dst).output().context("spawn cp")?;
+    let run = |reflink: &str| Command::new("cp").arg("-a").arg(reflink).arg("-T").arg(src).arg(dst).output();
+    let mut out = run(reflink).context("spawn cp")?;
+    // btrfs refuses to clone between files whose NOCOW (chattr +C) flags differ, and cp -a does
+    // not copy that flag: such files are copied instead of cloned
+    if !out.status.success()
+        && mode == ReflinkMode::Always
+        && String::from_utf8_lossy(&out.stderr).contains("failed to clone")
+    {
+        tracing::warn!(
+            "cp: some files under {} cannot be reflinked (NOCOW?); copying their data instead",
+            src.display()
+        );
+        out = run("--reflink=auto").context("spawn cp")?;
+    }
     if !out.status.success() {
         bail!("cp -a {} {} failed: {}", src.display(), dst.display(), String::from_utf8_lossy(&out.stderr).trim());
     }

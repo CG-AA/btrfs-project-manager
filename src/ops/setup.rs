@@ -12,6 +12,9 @@ use std::process::Command;
 
 pub const SERVICE: &str = include_str!("../../assets/systemd/bpm.service");
 pub const TIMER: &str = include_str!("../../assets/systemd/bpm.timer");
+pub const HEAVY_SERVICE: &str = include_str!("../../assets/systemd/bpm-heavy.service");
+pub const HEAVY_TIMER: &str = include_str!("../../assets/systemd/bpm-heavy.timer");
+pub const TIMERS: [&str; 2] = ["bpm.timer", "bpm-heavy.timer"];
 pub const CLAUDE_HOOK: &str = include_str!("../../assets/claude-hook.json");
 
 fn write_if_changed(ctx: &Ctx, path: &Path, content: &str, steps: &mut Vec<String>) -> Result<bool> {
@@ -102,14 +105,29 @@ pub fn run(ctx: &Ctx, a: SetupArgs) -> Result<()> {
         rw.push(format!("-{}", cfg.global.archive_dir.parent().unwrap().display()));
     }
     if !a.no_units {
-        let service = SERVICE.replace("@BIN@", &a.bin.display().to_string()).replace("@RW@", &rw.join(" "));
-        let changed = write_if_changed(ctx, Path::new("/etc/systemd/system/bpm.service"), &service, &mut steps)?
-            | write_if_changed(ctx, Path::new("/etc/systemd/system/bpm.timer"), TIMER, &mut steps)?;
+        // the units run with exactly the config this setup used
+        let cfg_abs = std::path::absolute(&cfg_path)?;
+        let fill = |unit: &str| {
+            unit.replace("@BIN@", &a.bin.display().to_string())
+                .replace("@RW@", &rw.join(" "))
+                .replace("@CFG@", &cfg_abs.display().to_string())
+        };
+        let mut changed = false;
+        for (name, content) in [
+            ("bpm.service", fill(SERVICE)),
+            ("bpm.timer", fill(TIMER)),
+            ("bpm-heavy.service", fill(HEAVY_SERVICE)),
+            ("bpm-heavy.timer", fill(HEAVY_TIMER)),
+        ] {
+            changed |= write_if_changed(ctx, &Path::new("/etc/systemd/system").join(name), &content, &mut steps)?;
+        }
         if changed {
             systemctl(ctx, &["daemon-reload"], &mut steps)?;
         }
         if !a.no_enable {
-            systemctl(ctx, &["enable", "--now", "bpm.timer"], &mut steps)?;
+            let mut args = vec!["enable", "--now"];
+            args.extend(TIMERS);
+            systemctl(ctx, &args, &mut steps)?;
         }
         if !a.bin.exists() {
             tracing::warn!("{} does not exist yet; install the binary there (see scripts/install.sh)", a.bin.display());

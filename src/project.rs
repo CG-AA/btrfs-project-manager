@@ -8,10 +8,48 @@ use crate::store::{ProjectRecord, Store, Unit};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-pub const LEFTOVER_MARKERS: &[&str] = &[".bpm-tmp", ".bpm-old", ".bpm-rollback-"];
+pub const LEFTOVER_MARKERS: &[&str] = &[".bpm-tmp", ".bpm-old", ".bpm-rollback-", ".bpm-keep-"];
 
 pub fn is_leftover_name(name: &str) -> bool {
     LEFTOVER_MARKERS.iter().any(|m| name.contains(m))
+}
+
+/// A directory name left behind by an interrupted or unproven operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Leftover {
+    /// `<base>.bpm-tmp`: a copy being built, or the original right after the swap.
+    Tmp { base: String },
+    /// `<base>.bpm-old`: the original after the swap, before cleanup.
+    Old { base: String },
+    /// `<base>.bpm-rollback-<ts>`: the pre-rollback subvolume.
+    Rollback { base: String },
+    /// `<base>.bpm-keep-<op>-<ts>`: kept because deleting it could lose data. Never auto-fixed.
+    Keep { base: String, op: String },
+}
+
+impl Leftover {
+    pub fn parse(name: &str) -> Option<Leftover> {
+        if let Some(i) = name.find(".bpm-keep-") {
+            let op = name[i + ".bpm-keep-".len()..].split('-').next().unwrap_or("").to_string();
+            return Some(Leftover::Keep { base: name[..i].into(), op });
+        }
+        if let Some(i) = name.find(".bpm-rollback-") {
+            return Some(Leftover::Rollback { base: name[..i].into() });
+        }
+        if let Some(b) = name.strip_suffix(".bpm-tmp") {
+            return Some(Leftover::Tmp { base: b.into() });
+        }
+        name.strip_suffix(".bpm-old").map(|b| Leftover::Old { base: b.into() })
+    }
+
+    pub fn base(&self) -> &str {
+        match self {
+            Leftover::Tmp { base }
+            | Leftover::Old { base }
+            | Leftover::Rollback { base }
+            | Leftover::Keep { base, .. } => base,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -159,4 +197,24 @@ pub fn effective(ctx: &Ctx, root: &RootCfg, name: &str, path: &Path) -> Result<E
         None
     };
     effective_for(&ctx.cfg, root, name, path, file.as_ref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn leftover_names() {
+        assert_eq!(Leftover::parse("demo.bpm-old"), Some(Leftover::Old { base: "demo".into() }));
+        assert_eq!(Leftover::parse("demo.bpm-tmp"), Some(Leftover::Tmp { base: "demo".into() }));
+        assert_eq!(
+            Leftover::parse("demo.bpm-rollback-20260915T101010"),
+            Some(Leftover::Rollback { base: "demo".into() })
+        );
+        assert_eq!(
+            Leftover::parse("demo.bpm-keep-adopt-20260915T101010"),
+            Some(Leftover::Keep { base: "demo".into(), op: "adopt".into() })
+        );
+        assert_eq!(Leftover::parse("demo"), None);
+        assert!(is_leftover_name("x.bpm-keep-restore-1"));
+    }
 }

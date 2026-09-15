@@ -73,7 +73,7 @@ pub fn run(ctx: &Ctx, a: MigrateArgs) -> Result<()> {
     if a.import {
         let unit = store.container();
         unit.ensure_dir()?;
-        let _l = unit.lock(ctx.cfg.global.lock_timeout)?;
+        let unit = unit.lock(ctx.cfg.global.lock_timeout)?;
         let rec = super::snap::container_record(ctx, &root, &unit)?;
         for (n, snap, desc) in snapper_snapshots(&root.path) {
             let info = ctx.btrfs.subvol_info(&snap)?;
@@ -88,7 +88,6 @@ pub fn run(ctx: &Ctx, a: MigrateArgs) -> Result<()> {
             }
             let tmp = unit.dir.join(format!("{id}.tmp"));
             std::fs::create_dir(&tmp)?;
-            crate::util::fs::rename_strict(&snap, &tmp.join("snapshot"))?;
             let meta = SnapshotMeta {
                 format: 1,
                 id,
@@ -111,9 +110,24 @@ pub fn run(ctx: &Ctx, a: MigrateArgs) -> Result<()> {
                     argv: ctx.invoker.argv.clone(),
                 },
             };
-            unit.write_meta(&tmp, &meta)?;
+            // metadata first: an interrupted import leaves a tmp dir marked as imported, which
+            // cleanup never deletes
+            unit.write_new_meta(&tmp, &meta)?;
+            // a read-only subvolume cannot move to another directory (its `..` is read-only)
+            let dst = tmp.join("snapshot");
+            ctx.btrfs.set_readonly(&snap, false)?;
+            let moved = ctx.fs.rename(&snap, &dst);
+            let back = ctx.btrfs.set_readonly(if moved.is_ok() { &dst } else { &snap }, true);
+            if let Err(e) = moved {
+                let _ = std::fs::remove_dir_all(&tmp);
+                if let Err(ro) = back {
+                    tracing::error!("{} was left writable: {ro:#}", snap.display());
+                }
+                return Err(e.context(format!("import snapper #{n}; it stays in {}", snap.display())));
+            }
+            back?;
             std::fs::rename(&tmp, unit.snapshot_dir(id))?;
-            let _ = std::fs::remove_dir_all(snap.parent().unwrap());
+            let _ = ctx.fs.remove_dir_all(snap.parent().unwrap());
         }
     }
 

@@ -36,20 +36,29 @@ pub fn parse(s: &str, tz: &TimeZone) -> Result<SnapSelector> {
     })
 }
 
-pub fn resolve<'a>(sel: &SnapSelector, snaps: &'a [SnapshotMeta]) -> Result<&'a SnapshotMeta> {
+/// `frozen_ref` is the last good snapshot of a frozen project: `held` means that one, not
+/// whichever snapshot was held most recently (a further shrink holds an already damaged one).
+pub fn resolve<'a>(sel: &SnapSelector, snaps: &'a [SnapshotMeta], frozen_ref: Option<u64>) -> Result<&'a SnapshotMeta> {
     let mut by_time: Vec<&SnapshotMeta> = snaps.iter().collect();
     by_time.sort_by_key(|m| (m.created, m.id));
     let found = match sel {
         SnapSelector::Id(id) => snaps.iter().find(|m| m.id == *id),
         SnapSelector::Latest(n) => by_time.iter().rev().nth(*n).copied(),
         SnapSelector::At(ts) => by_time.iter().rev().find(|m| m.created <= *ts).copied(),
-        SnapSelector::Held => by_time.iter().rev().find(|m| m.hold).copied(),
+        SnapSelector::Held => frozen_ref
+            .and_then(|id| snaps.iter().find(|m| m.id == id))
+            .or_else(|| by_time.iter().rev().find(|m| m.hold).copied()),
     };
     found.ok_or_else(|| not_found(format!("no snapshot matches {sel:?}")))
 }
 
-pub fn resolve_str<'a>(s: &str, snaps: &'a [SnapshotMeta], tz: &TimeZone) -> Result<&'a SnapshotMeta> {
-    resolve(&parse(s, tz)?, snaps)
+pub fn resolve_str<'a>(
+    s: &str,
+    snaps: &'a [SnapshotMeta],
+    tz: &TimeZone,
+    frozen_ref: Option<u64>,
+) -> Result<&'a SnapshotMeta> {
+    resolve(&parse(s, tz)?, snaps, frozen_ref)
 }
 
 #[cfg(test)]
@@ -60,13 +69,16 @@ mod tests {
         let tz = TimeZone::UTC;
         let mut snaps: Vec<SnapshotMeta> = (1..=4).map(|i| SnapshotMeta::sample(i, "p")).collect();
         snaps[1].hold = true;
-        assert_eq!(resolve_str("3", &snaps, &tz).unwrap().id, 3);
-        assert_eq!(resolve_str("latest", &snaps, &tz).unwrap().id, 4);
-        assert_eq!(resolve_str("latest~1", &snaps, &tz).unwrap().id, 3);
-        assert_eq!(resolve_str("held", &snaps, &tz).unwrap().id, 2);
+        assert_eq!(resolve_str("3", &snaps, &tz, None).unwrap().id, 3);
+        assert_eq!(resolve_str("latest", &snaps, &tz, None).unwrap().id, 4);
+        assert_eq!(resolve_str("latest~1", &snaps, &tz, None).unwrap().id, 3);
+        assert_eq!(resolve_str("held", &snaps, &tz, None).unwrap().id, 2);
+        snaps[2].hold = true;
+        assert_eq!(resolve_str("held", &snaps, &tz, None).unwrap().id, 3, "newest held");
+        assert_eq!(resolve_str("held", &snaps, &tz, Some(2)).unwrap().id, 2, "frozen: the last good snapshot");
         let t = snaps[2].created.strftime("%Y-%m-%dT%H:%M:%S").to_string();
-        assert_eq!(resolve_str(&t, &snaps, &tz).unwrap().id, 3);
-        assert!(resolve_str("99", &snaps, &tz).is_err());
-        assert!(resolve_str("nonsense", &snaps, &tz).is_err());
+        assert_eq!(resolve_str(&t, &snaps, &tz, None).unwrap().id, 3);
+        assert!(resolve_str("99", &snaps, &tz, None).is_err());
+        assert!(resolve_str("nonsense", &snaps, &tz, None).is_err());
     }
 }

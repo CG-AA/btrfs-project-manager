@@ -100,6 +100,11 @@ impl Store {
         lock::Lock::acquire(&self.dir.join("lock"), timeout, "store")
     }
 
+    /// Serialises adopt, convert, collapse and recompress on this root; never waits.
+    pub fn heavy_lock(&self) -> Result<lock::Lock> {
+        lock::Lock::acquire(&self.dir.join("heavy.lock"), Duration::ZERO, "heavy operation")
+    }
+
     /// Project units that have a `project.toml`, sorted by name.
     pub fn units(&self) -> Result<Vec<(Unit, ProjectRecord)>> {
         let mut out = Vec::new();
@@ -159,36 +164,14 @@ impl Unit {
         read_toml(&self.record_path())
     }
 
-    pub fn write_record(&self, rec: &ProjectRecord) -> Result<()> {
-        self.ensure_dir()?;
-        write_toml(&self.record_path(), rec, self.dry_run)
-    }
-
     pub fn read_state(&self) -> Result<ProjectState> {
         Ok(read_toml(&self.state_path())?.unwrap_or_default())
     }
 
-    pub fn write_state(&self, st: &ProjectState) -> Result<()> {
-        self.ensure_dir()?;
-        write_toml(&self.state_path(), st, self.dry_run)?;
-        if self.dry_run {
-            return Ok(());
-        }
-        match &st.frozen {
-            Some(f) => write_atomic(&self.frozen_marker(), f.reasons.join("\n").as_bytes(), 0o644)?,
-            None => {
-                let _ = fs::remove_file(self.frozen_marker());
-            }
-        }
-        Ok(())
-    }
-
-    pub fn write_meta(&self, dir: &Path, meta: &SnapshotMeta) -> Result<()> {
-        write_toml(&dir.join("meta.toml"), meta, self.dry_run)
-    }
-
-    pub fn update_meta(&self, meta: &SnapshotMeta) -> Result<()> {
-        write_toml(&self.meta_path(meta.id), meta, self.dry_run)
+    /// Metadata of a snapshot being created in its own reserved `<id>.tmp` directory. The only
+    /// write allowed without the unit lock: nobody else can see that directory yet.
+    pub fn write_new_meta(&self, tmp: &Path, meta: &SnapshotMeta) -> Result<()> {
+        write_toml(&tmp.join("meta.toml"), meta, self.dry_run)
     }
 
     pub fn scan(&self) -> Result<Scan> {
@@ -239,9 +222,65 @@ impl Unit {
         Ok(max + 1)
     }
 
-    pub fn lock(&self, timeout: Duration) -> Result<lock::Lock> {
+    /// Every change to the unit's record, state or existing snapshot metadata goes through the
+    /// returned guard.
+    pub fn lock(&self, timeout: Duration) -> Result<LockedUnit> {
         self.ensure_dir()?;
-        lock::Lock::acquire(&self.dir.join("lock"), timeout, &self.name)
+        let lock = lock::Lock::acquire(&self.dir.join("lock"), timeout, &self.name)?;
+        Ok(LockedUnit { unit: self.clone(), _lock: lock })
+    }
+}
+
+/// A unit whose lock this process holds.
+pub struct LockedUnit {
+    unit: Unit,
+    _lock: lock::Lock,
+}
+
+impl std::ops::Deref for LockedUnit {
+    type Target = Unit;
+    fn deref(&self) -> &Unit {
+        &self.unit
+    }
+}
+
+impl LockedUnit {
+    pub fn write_record(&self, rec: &ProjectRecord) -> Result<()> {
+        self.ensure_dir()?;
+        write_toml(&self.record_path(), rec, self.dry_run)
+    }
+
+    pub fn write_state(&self, st: &ProjectState) -> Result<()> {
+        self.ensure_dir()?;
+        write_toml(&self.state_path(), st, self.dry_run)?;
+        if self.dry_run {
+            return Ok(());
+        }
+        match &st.frozen {
+            Some(f) => write_atomic(&self.frozen_marker(), f.reasons.join("\n").as_bytes(), 0o644)?,
+            None => {
+                let _ = fs::remove_file(self.frozen_marker());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn update_meta(&self, meta: &SnapshotMeta) -> Result<()> {
+        write_toml(&self.meta_path(meta.id), meta, self.dry_run)
+    }
+
+    /// Metadata for an existing snapshot directory that has none (recovery).
+    pub fn write_meta_in(&self, dir: &Path, meta: &SnapshotMeta) -> Result<()> {
+        write_toml(&dir.join("meta.toml"), meta, self.dry_run)
+    }
+
+    /// Rename the unit directory. The lock file moves with it, so the lock stays held.
+    pub fn rename_to(self, target: Unit) -> Result<LockedUnit> {
+        if !self.dry_run {
+            fs::rename(&self.unit.dir, &target.dir)
+                .with_context(|| format!("rename {} -> {}", self.unit.dir.display(), target.dir.display()))?;
+        }
+        Ok(LockedUnit { unit: target, _lock: self._lock })
     }
 }
 
@@ -263,11 +302,11 @@ mod tests {
         for id in [1u64, 2, 5] {
             fs::create_dir_all(unit.snapshot_path(id)).unwrap();
             let m = SnapshotMeta::sample(id, "demo");
-            unit.write_meta(&unit.snapshot_dir(id), &m).unwrap();
+            unit.write_new_meta(&unit.snapshot_dir(id), &m).unwrap();
         }
         fs::create_dir_all(unit.snapshot_path(7)).unwrap();
         fs::create_dir_all(unit.snapshot_dir(8)).unwrap();
-        unit.write_meta(&unit.snapshot_dir(8), &SnapshotMeta::sample(8, "demo")).unwrap();
+        unit.write_new_meta(&unit.snapshot_dir(8), &SnapshotMeta::sample(8, "demo")).unwrap();
         fs::create_dir_all(unit.dir.join("9.tmp")).unwrap();
         let scan = unit.scan().unwrap();
         assert_eq!(scan.snapshots.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 2, 5]);
@@ -284,6 +323,7 @@ mod tests {
             1000,
             "2026-01-01T00:00:00Z".parse().unwrap(),
         );
+        let unit = unit.lock(Duration::ZERO).unwrap();
         unit.write_record(&rec).unwrap();
         let mut st = ProjectState {
             frozen: Some(Frozen {

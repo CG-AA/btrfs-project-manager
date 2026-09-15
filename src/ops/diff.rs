@@ -52,12 +52,12 @@ pub fn run(ctx: &Ctx, a: DiffArgs) -> Result<()> {
     let pref = crate::project::resolve(ctx, &a.project)?;
     let eff = super::effective(ctx, &pref)?;
     let snaps = pref.unit.snapshots()?;
-    let from = super::select(ctx, &snaps, &a.from)?;
+    let from = super::select(ctx, &pref.unit, &snaps, &a.from)?;
     let to_label = a.to.clone().unwrap_or_else(|| "live".into());
     let to_path = if to_label == "live" {
         pref.path().to_path_buf()
     } else {
-        pref.unit.snapshot_path(super::select(ctx, &snaps, &to_label)?.id)
+        pref.unit.snapshot_path(super::select(ctx, &pref.unit, &snaps, &to_label)?.id)
     };
     let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
     let banned: Vec<PathBuf> = eff.banlist_paths();

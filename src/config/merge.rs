@@ -3,10 +3,34 @@
 use super::schema::*;
 use super::{BUILTIN_POLICY_TOML, builtin_profiles};
 use crate::util::fs::safe_relative;
+use crate::util::relpath::RelPath;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Policy tables `<project>/.bpm.toml` may not set: the file is writable by whatever works in the
+/// repository (an AI agent included), and these decide whether deletions are noticed and how
+/// long history is kept. Set them in the admin config (`[projects."name".policy]`).
+///
+/// `managed` is protected the same way, but only against being turned off (see `managed_from`):
+/// `managed = false` stops snapshots and the guard outright, which is every one of these tables
+/// weakened at once.
+pub const PROTECTED_FROM_PROJECT_FILE: &[&str] = &["shrink_guard", "thin"];
+
+/// Whether the project is managed, refusing `managed = false` from `.bpm.toml`: a file inside the
+/// project cannot opt the project out of protection, only the admin config can. Opting *in*
+/// (`managed = true`) weakens nothing and is allowed from either layer.
+fn managed_from(file: Option<&ProjectOverride>, global: Option<&ProjectOverride>, ignored: &mut Vec<String>) -> bool {
+    let from_file = match file.and_then(|f| f.managed) {
+        Some(false) => {
+            ignored.push("managed = false".into());
+            None
+        }
+        other => other,
+    };
+    from_file.or_else(|| global.and_then(|o| o.managed)).unwrap_or(true)
+}
 
 pub const POLICY_KEYS: &[&str] = &[
     "banlist_precreate",
@@ -25,17 +49,22 @@ pub struct EffectiveConfig {
     pub path: PathBuf,
     pub managed: bool,
     pub profiles: Vec<String>,
-    pub banlist: Vec<String>,
+    pub banlist: Vec<RelPath>,
     /// Banlist entries created ahead of time under `banlist_precreate = "primary"`.
-    pub primary_banlist: Vec<String>,
+    pub primary_banlist: Vec<RelPath>,
     pub sentinels: Vec<String>,
     pub policy: Policy,
     pub origins: BTreeMap<String, String>,
+    /// `.bpm.toml` policy tables that were ignored (see `PROTECTED_FROM_PROJECT_FILE`).
+    pub ignored_project_keys: Vec<String>,
 }
 
 impl EffectiveConfig {
     pub fn banlist_paths(&self) -> Vec<PathBuf> {
-        self.banlist.iter().map(PathBuf::from).collect()
+        self.banlist.iter().map(|b| b.as_path().to_path_buf()).collect()
+    }
+    pub fn is_banned(&self, rel: &str) -> bool {
+        self.banlist.iter().any(|b| b == rel)
     }
     /// Paths excluded from stats walks: banned dirs (even when still plain) and guard excludes.
     pub fn stats_exclude(&self) -> Vec<PathBuf> {
@@ -161,32 +190,41 @@ pub fn effective_for(
 
     let mut remove: Vec<String> = Vec::new();
     let mut sentinels_add = str_list(&cfg.defaults, "sentinels_add");
+    let mut ignored_project_keys = Vec::new();
     for (layer, origin) in [(global_over, format!("projects.{name}")), (file, ".bpm.toml".to_string())] {
         if let Some(o) = layer {
             banlist.extend(o.banlist_add.iter().cloned());
             primary.extend(o.banlist_add.iter().cloned());
             remove.extend(o.banlist_remove.iter().cloned());
             sentinels_add.extend(o.sentinels_add.iter().cloned());
-            deep_merge(&mut table, &o.policy, &origin, "", &mut origins);
+            let mut policy = o.policy.clone();
+            if origin == ".bpm.toml" {
+                for key in PROTECTED_FROM_PROJECT_FILE {
+                    if policy.remove(*key).is_some() {
+                        ignored_project_keys.push(format!("policy.{key}"));
+                    }
+                }
+            }
+            deep_merge(&mut table, &policy, &origin, "", &mut origins);
         }
     }
 
     let policy: Policy =
         toml::Value::Table(table).try_into().with_context(|| format!("project {name}: invalid policy"))?;
 
-    let norm = |s: &String| safe_relative(s).map(|p| p.to_string_lossy().into_owned());
-    let removed: Vec<String> = remove.iter().filter_map(norm).collect();
+    let norm = |s: &String| RelPath::parse(s);
+    let removed: Vec<RelPath> = remove.iter().filter_map(norm).collect();
     let mut seen = std::collections::BTreeSet::new();
-    let banlist: Vec<String> =
+    let banlist: Vec<RelPath> =
         banlist.iter().filter_map(norm).filter(|b| !removed.contains(b)).filter(|b| seen.insert(b.clone())).collect();
     let mut sentinels: Vec<String> = policy.shrink_guard.sentinels.clone();
     for s in sentinels_add.iter().filter_map(norm) {
-        if !sentinels.contains(&s) {
-            sentinels.push(s);
+        if !sentinels.iter().any(|x| s == *x) {
+            sentinels.push(s.to_string());
         }
     }
-    let primary_banlist: Vec<String> = primary.iter().filter_map(norm).filter(|p| banlist.contains(p)).collect();
-    let managed = file.and_then(|f| f.managed).or_else(|| global_over.and_then(|o| o.managed)).unwrap_or(true);
+    let primary_banlist: Vec<RelPath> = primary.iter().filter_map(norm).filter(|p| banlist.contains(p)).collect();
+    let managed = managed_from(file, global_over, &mut ignored_project_keys);
     Ok(EffectiveConfig {
         name: name.into(),
         path: path.into(),
@@ -197,6 +235,7 @@ pub fn effective_for(
         sentinels,
         policy,
         origins,
+        ignored_project_keys,
     })
 }
 
@@ -253,19 +292,57 @@ level = 15
         assert_eq!(e.origins["recompress.level"], "projects.demo");
         assert_eq!(e.origins["thin.hourly"], "builtin");
         assert!(e.managed);
+        assert!(e.ignored_project_keys.is_empty());
+    }
+
+    #[test]
+    fn project_file_cannot_weaken_the_guard_or_retention() {
+        let cfg = parse(CFG, "t").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file: ProjectOverride = toml::from_str(
+            "[policy.shrink_guard]\nenabled = false\n[policy.thin]\nkeep_all = '0s'\n[policy.lifecycle]\ndormant_after = '30d'\n",
+        )
+        .unwrap();
+        let e = effective_for(&cfg, &cfg.roots[0], "demo", dir.path(), Some(&file)).unwrap();
+        assert!(e.policy.shrink_guard.enabled);
+        assert_eq!(e.policy.thin.keep_all, Duration::from_secs(12 * 3600));
+        assert_eq!(e.policy.lifecycle.dormant_after, Duration::from_secs(30 * 86400), "other tables still apply");
+        assert_eq!(e.ignored_project_keys, vec!["policy.shrink_guard", "policy.thin"]);
     }
 
     #[test]
     fn detection_defaults_to_generic_and_project_config_can_be_disabled() {
         let mut cfg = parse(CFG, "t").unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let file: ProjectOverride = toml::from_str("managed = false").unwrap();
+        let file: ProjectOverride = toml::from_str("managed = true").unwrap();
         let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), Some(&file)).unwrap();
         assert_eq!(e.profiles, vec!["generic"]);
-        assert!(!e.managed);
+        assert!(e.managed);
         cfg.global.project_config = false;
         let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), Some(&file)).unwrap();
         assert!(e.managed);
+    }
+
+    #[test]
+    fn project_file_cannot_turn_management_off() {
+        let cfg = parse(CFG, "t").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file: ProjectOverride = toml::from_str("managed = false").unwrap();
+        let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), Some(&file)).unwrap();
+        assert!(e.managed, "a file inside the project cannot stop bpm protecting it");
+        assert_eq!(e.ignored_project_keys, vec!["managed = false"]);
+    }
+
+    #[test]
+    fn admin_config_can_still_turn_management_off() {
+        let cfg = parse("version=1\n[[root]]\npath='/x'\n[projects.other]\nmanaged = false\n", "t").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), None).unwrap();
+        assert!(!e.managed);
+        // and the project file cannot turn it back on either way round
+        let file: ProjectOverride = toml::from_str("managed = true").unwrap();
+        let e = effective_for(&cfg, &cfg.roots[0], "other", dir.path(), Some(&file)).unwrap();
+        assert!(e.managed, "opting in weakens nothing");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Restore paths from a snapshot, roll a whole project back, or recreate a deleted project.
 
 use super::Target;
+use super::retire::{self, Expect, Outcome};
 use super::snapshot::{self, SnapOpts};
 use crate::config::EffectiveConfig;
 use crate::ctx::Ctx;
@@ -8,9 +9,10 @@ use crate::error::refused;
 use crate::hooks::{self, HookCtx, HookEvent};
 use crate::project::ProjectRef;
 use crate::store::journal::Journal;
-use crate::store::{SnapshotKind, SnapshotMeta};
+use crate::store::{LockedUnit, SnapshotKind, SnapshotMeta};
 use crate::util::fs::{lchown, rename_strict, safe_relative, sibling};
-use crate::util::proc;
+use crate::util::relpath::RelPath;
+use crate::util::{proc, walk};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,8 @@ pub struct RestoreReport {
     pub restored: Vec<PathBuf>,
     pub pre_snapshot: Option<u64>,
     pub warnings: Vec<String>,
+    /// Replaced paths kept because they held something the pre-restore snapshot does not.
+    pub kept: Vec<PathBuf>,
 }
 
 fn normalize_rel(live: &Path, p: &str) -> Result<PathBuf> {
@@ -46,14 +50,17 @@ pub fn restore_paths(
 ) -> Result<RestoreReport> {
     let snap = pref.unit.snapshot_path(meta.id);
     let live = pref.path().to_path_buf();
-    let mut report = RestoreReport { restored: vec![], pre_snapshot: None, warnings: vec![] };
+    let mut report = RestoreReport { restored: vec![], pre_snapshot: None, warnings: vec![], kept: vec![] };
     let mut plan = Vec::new();
     for p in paths {
         let rel = normalize_rel(&live, p)?;
-        let src = snap.join(&rel);
+        let relpath =
+            RelPath::parse(&rel.to_string_lossy()).ok_or_else(|| refused(format!("invalid relative path {p:?}")))?;
+        // the snapshot is a copy of the project: a symlinked directory in it leads outside too
+        let src = relpath.under(&snap)?;
         let smd = std::fs::symlink_metadata(&src)
             .map_err(|_| crate::error::not_found(format!("{} is not in snapshot #{}", rel.display(), meta.id)))?;
-        if eff.banlist.iter().any(|b| rel.starts_with(b)) {
+        if eff.banlist.iter().any(|b| rel.starts_with(b.as_path())) {
             report.warnings.push(format!(
                 "{} is a banned (unsnapshotted) directory; the snapshot only has an empty placeholder",
                 rel.display()
@@ -64,7 +71,8 @@ pub fn restore_paths(
         }
         let dst = match to {
             Some(d) => d.join(rel.file_name().unwrap_or(rel.as_os_str())),
-            None => live.join(&rel),
+            // never create or replace through a symlink that leads out of the project
+            None => relpath.under(&live)?,
         };
         if dst.symlink_metadata().is_ok() && !overwrite {
             return Err(refused(format!(
@@ -74,6 +82,8 @@ pub fn restore_paths(
         }
         plan.push((rel, src, dst));
     }
+    // compared with file timestamps, so the real clock
+    let started = jiff::Timestamp::now();
     if plan.iter().any(|(_, _, d)| d.symlink_metadata().is_ok() && d.starts_with(&live)) {
         let target = Target::for_project(pref, eff);
         let m = snapshot::take(
@@ -100,17 +110,58 @@ pub fn restore_paths(
                 }
             }
         }
-        if let Ok(dmd) = std::fs::symlink_metadata(&dst) {
-            if dmd.is_dir() && !dmd.file_type().is_symlink() {
-                if ctx.btrfs.is_subvolume(&dst)? {
-                    bail!("{} is a subvolume; refusing to replace it", dst.display());
-                }
-                std::fs::remove_dir_all(&dst)?;
-            } else {
-                std::fs::remove_file(&dst)?;
+        let existing = std::fs::symlink_metadata(&dst).ok();
+        if let Some(dmd) = &existing {
+            if dmd.is_dir() && ctx.btrfs.is_subvolume(&dst)? {
+                bail!("{} is a subvolume; refusing to replace it", dst.display());
             }
         }
-        crate::util::fs::cp_a(&src, &dst, ctx.reflink)?;
+        // copy next to the destination first: a failed copy leaves the destination untouched
+        let tmp = sibling(&dst, ".bpm-tmp");
+        if tmp.symlink_metadata().is_ok() {
+            bail!("{} exists (an interrupted restore?); remove it first", tmp.display());
+        }
+        if let Err(e) = crate::util::fs::cp_a(&src, &tmp, ctx.reflink) {
+            if std::fs::symlink_metadata(&tmp).is_ok_and(|m| m.is_dir()) {
+                let _ = std::fs::remove_dir_all(&tmp);
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            return Err(e);
+        }
+        if let Some(dmd) = &existing {
+            // The exchange below bumps the replaced inode's ctime, so a file is judged on the
+            // facts read before the move; a directory's own ctime is not part of its tree stats.
+            let expect = if dmd.is_dir() {
+                Expect::Tree { stats: None, not_after: started, exclude: vec![] }
+            } else {
+                Expect::Replaced { pre: retire::FileFacts::of(dmd), not_after: started }
+            };
+            ctx.fs.rename_exchange(&dst, &tmp)?;
+            // `tmp` now holds what was replaced; it is deleted only if the pre-restore snapshot
+            // has all of it (no nested subvolumes or mounts, nothing written since)
+            let in_project = dst.starts_with(&live);
+            match if in_project {
+                retire::retire(ctx, &tmp, &expect, &[], "restore")?
+            } else {
+                retire::delete(
+                    ctx,
+                    retire::prove(ctx, &tmp, &expect, &[]).map_err(|e| {
+                        refused(format!(
+                            "{} was replaced but could not be removed ({e}); it is at {}",
+                            dst.display(),
+                            tmp.display()
+                        ))
+                    })?,
+                )
+                .map(|_| Outcome::Deleted)?
+            } {
+                Outcome::Deleted => {}
+                Outcome::Kept(k) => report.kept.push(k),
+            }
+        } else {
+            ctx.fs.rename(&tmp, &dst)?;
+        }
         if to.is_some() && !crate::privilege::is_root() {
             // copying out as a normal user already has the right owner
         } else if to.is_some() {
@@ -135,17 +186,11 @@ pub struct RollbackReport {
     pub leftover: Option<PathBuf>,
 }
 
-fn nested_under(ctx: &Ctx, dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut it = walkdir::WalkDir::new(dir).follow_links(false).min_depth(1).into_iter();
-    while let Some(entry) = it.next() {
-        let Ok(e) = entry else { continue };
-        if crate::util::walk::entry_is_subvol(&e, &|p, i| ctx.is_subvol(p, i)) {
-            out.push(e.path().strip_prefix(dir).unwrap().to_path_buf());
-            it.skip_current_dir();
-        }
-    }
-    out
+fn nested_under(ctx: &Ctx, dir: &Path) -> Result<Vec<PathBuf>> {
+    Ok(walk::nested_subvolumes(dir, &|p, i| ctx.is_subvol(p, i))?
+        .into_iter()
+        .map(|p| p.strip_prefix(dir).unwrap().to_path_buf())
+        .collect())
 }
 
 /// Place a writable copy of `meta` at `live` and fix up nested subvolume placeholders.
@@ -161,6 +206,7 @@ fn materialize(ctx: &Ctx, pref: &ProjectRef, meta: &SnapshotMeta, live: &Path) -
 
 pub fn rollback(
     ctx: &Ctx,
+    lu: &LockedUnit,
     pref: &mut ProjectRef,
     eff: &EffectiveConfig,
     meta: &SnapshotMeta,
@@ -169,7 +215,11 @@ pub fn rollback(
 ) -> Result<RollbackReport> {
     let live = pref.path().to_path_buf();
     if !ctx.btrfs.is_subvolume(&live).unwrap_or(false) {
-        return Err(refused(format!("{} does not exist; use `bpm restore --project {}`", live.display(), pref.name())));
+        return Err(refused(format!(
+            "{} does not exist; use `bpm restore {} --recreate`",
+            live.display(),
+            pref.name()
+        )));
     }
     let writers = proc::writers_under(&live);
     if !writers.is_empty() && !force {
@@ -191,16 +241,14 @@ pub fn rollback(
         ..Default::default()
     };
     hooks::run(ctx, HookEvent::PreRollback, &hctx)?;
-    let safety = {
+    if ctx.opts.dry_run {
+        tracing::info!("[dry-run] rollback {} to snapshot #{}", live.display(), meta.id);
         let target = Target::for_project(pref, eff);
-        snapshot::take(
+        let safety = snapshot::take(
             ctx,
             &target,
             &SnapOpts::new(SnapshotKind::Rollback, format!("before rollback to #{}", meta.id)),
-        )?
-    };
-    if ctx.opts.dry_run {
-        tracing::info!("[dry-run] rollback {} to snapshot #{}", live.display(), meta.id);
+        )?;
         return Ok(RollbackReport {
             safety_snapshot: safety.id,
             moved_nested: vec![],
@@ -216,12 +264,28 @@ pub fn rollback(
         &[("snapshot", meta.id.to_string()), ("path", live.display().to_string())],
         false,
     )?;
-    let nested = nested_under(ctx, &live);
+    let nested = nested_under(ctx, &live)?;
     let ts = ctx.now().strftime("%Y%m%dT%H%M%S").to_string();
     let aside = sibling(&live, &format!(".bpm-rollback-{ts}"));
     journal.set("aside", aside.display().to_string())?;
     journal.step(3)?;
-    rename_strict(&live, &aside)?;
+    // Move the live tree aside first and snapshot it there: a write that still lands in it
+    // (a shell whose working directory is inside) is caught before it is deleted.
+    ctx.fs.rename(&live, &aside)?;
+    let safety = {
+        let mut target = Target::for_project(pref, eff);
+        target.live = &aside;
+        snapshot::take(ctx, &target, &SnapOpts::new(SnapshotKind::Rollback, format!("before rollback to #{}", meta.id)))
+    };
+    let safety = match safety {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = rename_strict(&aside, &live);
+            journal.finish()?;
+            return Err(e.context("rollback: could not snapshot the current state; nothing changed"));
+        }
+    };
+    journal.set("safety_snapshot", safety.id.to_string())?;
     journal.step(4)?;
     if let Err(e) = materialize(ctx, pref, meta, &live) {
         let _ = rename_strict(&aside, &live);
@@ -229,18 +293,34 @@ pub fn rollback(
         return Err(e.context("rollback: could not create the new live subvolume; original restored"));
     }
     journal.step(5)?;
+    // record the new identity right away, so an interruption below leaves a managed project
+    let info = ctx.btrfs.subvol_info(&live)?;
+    let old_uuid = pref.record.uuid;
+    pref.record.uuid_history.push(old_uuid);
+    pref.record.uuid = info.uuid;
+    lu.write_record(&pref.record)?;
+    journal.step(6)?;
+    // checked before nested subvolumes are moved out (which changes the aside's counters)
+    let unchanged = retire::prove(ctx, &aside, &Expect::Snapshot { kept: &safety }, &nested).map(|_| ());
     let mut moved = Vec::new();
     let mut dropped = Vec::new();
     for rel in &nested {
-        let banned = eff.banlist.iter().any(|b| Path::new(b) == rel);
+        let banned = eff.banlist.iter().any(|b| b.as_path() == rel);
         if drop_build && banned {
             dropped.push(rel.clone());
             continue;
         }
-        let dst = live.join(rel);
+        let Some(dst) = RelPath::parse(&rel.to_string_lossy()).and_then(|r| r.under(&live).ok()) else {
+            tracing::warn!(
+                "rollback: {} is under a symlink in the snapshot; nested subvolume left in {}",
+                rel.display(),
+                aside.display()
+            );
+            continue;
+        };
         if let Ok(dmd) = std::fs::symlink_metadata(&dst) {
             if dmd.is_dir() && crate::util::fs::dir_is_empty(&dst)? {
-                std::fs::remove_dir(&dst)?;
+                ctx.fs.remove_dir(&dst)?;
             } else {
                 tracing::warn!(
                     "rollback: {} exists in the snapshot and is not an empty placeholder; nested subvolume left in {}",
@@ -255,38 +335,27 @@ pub fn rollback(
                 std::fs::create_dir_all(parent)?;
             }
         }
-        rename_strict(&aside.join(rel), &dst).with_context(|| format!("move nested subvolume {}", rel.display()))?;
+        ctx.fs.rename(&aside.join(rel), &dst).with_context(|| format!("move nested subvolume {}", rel.display()))?;
         moved.push(rel.clone());
     }
-    journal.step(6)?;
-    let info = ctx.btrfs.subvol_info(&live)?;
-    let old_uuid = pref.record.uuid;
-    pref.record.uuid_history.push(old_uuid);
-    pref.record.uuid = info.uuid;
-    pref.unit.write_record(&pref.record)?;
     journal.step(7)?;
-    // Recursive delete only when every nested subvolume still inside is a build dir we chose to
-    // drop; anything else left behind (a user subvolume that could not be moved) must survive.
-    let left_behind: Vec<&PathBuf> = nested.iter().filter(|n| !moved.contains(n)).collect();
-    let recursive = !dropped.is_empty() && left_behind.iter().all(|n| dropped.contains(n));
-    if left_behind.iter().any(|n| !dropped.contains(n)) {
-        tracing::warn!(
-            "rollback: nested subvolumes left in {}: {}",
-            aside.display(),
-            left_behind
-                .iter()
-                .filter(|n| !dropped.contains(n))
-                .map(|n| n.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    let leftover = match ctx.btrfs.delete_subvolume(&aside, recursive) {
-        Ok(()) => None,
-        Err(e) => {
-            tracing::warn!("rollback: could not delete {}: {e:#}; `bpm doctor --fix` will retry", aside.display());
-            Some(aside)
-        }
+    // Delete the aside only when it still equals the safety snapshot and holds nothing else:
+    // nested subvolumes left behind are build dirs the user chose to drop, or it is kept.
+    let leftover = match unchanged {
+        Err(why) => keep_aside(ctx, &aside, &why.to_string())?,
+        Ok(()) => match retire::prove(ctx, &aside, &Expect::Verified, &dropped) {
+            Ok(proof) => match retire::delete(ctx, proof) {
+                Ok(()) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        "rollback: could not delete {}: {e:#}; `bpm doctor --fix` will retry",
+                        aside.display()
+                    );
+                    Some(aside)
+                }
+            },
+            Err(why) => keep_aside(ctx, &aside, &why.to_string())?,
+        },
     };
     journal.finish()?;
     hooks::run(ctx, HookEvent::PostRollback, &hctx)?;
@@ -300,8 +369,18 @@ pub fn rollback(
     })
 }
 
+fn keep_aside(ctx: &Ctx, aside: &Path, why: &str) -> Result<Option<PathBuf>> {
+    let keep = retire::keep_name(ctx, aside, "rollback");
+    ctx.fs.rename(aside, &keep)?;
+    tracing::error!(
+        "rollback: kept the previous tree as {} instead of deleting it: {why}. Compare with the rollback snapshot and merge by hand, then delete it",
+        keep.display()
+    );
+    Ok(Some(keep))
+}
+
 /// Recreate a deleted (orphaned) or archived project from a snapshot.
-pub fn recreate(ctx: &Ctx, pref: &mut ProjectRef, meta: &SnapshotMeta) -> Result<String> {
+pub fn recreate(ctx: &Ctx, lu: &LockedUnit, pref: &mut ProjectRef, meta: &SnapshotMeta) -> Result<String> {
     let live = pref.path().to_path_buf();
     if live.symlink_metadata().is_ok() {
         return Err(refused(format!("{} exists; use `bpm rollback` instead", live.display())));
@@ -317,6 +396,6 @@ pub fn recreate(ctx: &Ctx, pref: &mut ProjectRef, meta: &SnapshotMeta) -> Result
         pref.record.uuid_history.push(old);
     }
     pref.record.uuid = info.uuid;
-    pref.unit.write_record(&pref.record)?;
+    lu.write_record(&pref.record)?;
     Ok(info.uuid.to_string())
 }

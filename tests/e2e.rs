@@ -393,3 +393,84 @@ fn e2e_wrap_and_doctor_fix() {
     let after = t.ok(&["doctor"]);
     assert!(!after.contains("interrupted"), "{after}");
 }
+
+#[test]
+#[ignore]
+fn e2e_nocow_and_cross_entry_hardlinks_adopt() {
+    let t = setup!("nocow");
+    let p = t.p("vm").display().to_string();
+    // a NOCOW directory (VM images, databases) and a hardlink between two top-level entries
+    sh(&format!(
+        "mkdir -p {p}/images {p}/bin {p}/scripts && chattr +C {p}/images && head -c 2000000 /dev/urandom > {p}/images/disk.img \
+         && echo tool > {p}/scripts/tool && ln {p}/scripts/tool {p}/bin/tool && chown -R {}:{} {p}",
+        t.uid, t.gid
+    ));
+    let image = fs::read(t.p("vm/images/disk.img")).unwrap();
+    t.ok(&["adopt", "vm"]);
+    assert_eq!(ino(&t.p("vm")), 256);
+    assert!(fs::read(t.p("vm/images/disk.img")).unwrap() == image, "NOCOW image copied intact");
+    assert_eq!(fs::read_to_string(t.p("vm/bin/tool")).unwrap(), "tool\n");
+    assert!(!t.root.join("vm.bpm-old").exists() && !t.root.join("vm.bpm-tmp").exists());
+}
+
+#[test]
+#[ignore]
+fn e2e_unflushed_append_is_not_identical() {
+    let t = setup!("flush");
+    t.make_project("demo");
+    t.ok(&["adopt", "demo"]);
+    // an append does not move ctransid until writeback; rollback must flush before comparing
+    sh(&format!("echo corrupted >> {}/src/f5.rs", t.p("demo").display()));
+    t.ok(&["rollback", "demo", "latest"]);
+    assert!(!fs::read_to_string(t.p("demo/src/f5.rs")).unwrap().contains("corrupted"));
+}
+
+#[test]
+#[ignore]
+fn e2e_readonly_snapshot_moves_between_directories() {
+    use bpm::btrfs::Btrfs;
+    let t = setup!("romove");
+    let b = bpm::btrfs::real::RealBtrfs::default();
+    sh(&format!("mkdir -p {0}/.snapshots/1 {0}/store && echo x > {0}/f", t.root.display()));
+    let snap = t.root.join(".snapshots/1/snapshot");
+    b.snapshot(&t.root, &snap, true).unwrap();
+    let before = get_subvol_info(&snap).unwrap();
+    let dst = t.root.join("store/snapshot");
+    assert!(fs::rename(&snap, &dst).is_err(), "a read-only subvolume cannot change directory");
+    // what `migrate-from-snapper --import` does
+    b.set_readonly(&snap, false).unwrap();
+    fs::rename(&snap, &dst).unwrap();
+    b.set_readonly(&dst, true).unwrap();
+    let after = get_subvol_info(&dst).unwrap();
+    assert_eq!((after.uuid, after.parent_uuid, after.ctransid), (before.uuid, before.parent_uuid, before.ctransid));
+    assert!(after.readonly());
+}
+
+#[test]
+#[ignore]
+fn e2e_project_hook_runs_as_owner_without_groups() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = setup!("phook");
+    let cfg = fs::read_to_string(&t.cfg).unwrap();
+    assert!(cfg.contains("[global]\n"), "config template changed: {cfg}");
+    fs::write(&t.cfg, cfg.replace("[global]\n", "[global]\nproject_hooks = \"on\"\n")).unwrap();
+    t.make_project("demo");
+    t.ok(&["adopt", "demo"]);
+    let dir = t.p("demo/.bpm/hooks/pre-snapshot");
+    let out = t.base.join("hook-out.tmp");
+    fs::create_dir_all(&dir).unwrap();
+    let hook = dir.join("10-id");
+    fs::write(&hook, format!("#!/bin/sh\nid -u > '{o}'; id -G >> '{o}'\n", o = out.display())).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    // the hook runs as the owner: it may only write to a file the owner can open
+    sh(&format!(
+        "chown -R {u}:{g} {proj}/.bpm && touch {o} && chown {u}:{g} {o}",
+        o = out.display(),
+        u = t.uid,
+        g = t.gid,
+        proj = t.p("demo").display()
+    ));
+    t.ok(&["snap", "demo"]);
+    let got = fs::read_to_string(&out).unwrap();
+    assert_eq!(got, format!("{}\n{}\n", t.uid, t.gid), "uid, then only the primary group");
+}

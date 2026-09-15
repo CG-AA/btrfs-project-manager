@@ -4,6 +4,7 @@ use crate::cli::SnapArgs;
 use crate::ctx::Ctx;
 use crate::error::usage;
 use crate::mechanics::Target;
+use crate::mechanics::observe;
 use crate::mechanics::snapshot::{self, SnapOpts};
 use crate::output::emit;
 use crate::policy::change;
@@ -14,7 +15,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 #[derive(Serialize, Debug)]
 pub struct SnapResult {
@@ -144,20 +145,21 @@ pub fn snap_project(ctx: &Ctx, pref: &ProjectRef, a: &SnapArgs, kind: SnapshotKi
     o.hold = a.hold;
     o.pair = a.pair;
     let meta = snapshot::take(ctx, &target, &o)?;
-    st.snap_ctransid = meta.source_ctransid;
-    st.last_snapshot_at = Some(meta.created);
-    if meta.stats.is_some() {
-        st.last_stats_at = Some(meta.created);
-    }
-    if lock.is_some() {
+    // Without the lock the tick owns the state; it counts and checks this snapshot next time.
+    if let Some(lu) = &lock {
+        observe::note_snapshot(&mut st, &meta);
         snaps.push(meta.clone());
-        crate::mechanics::guard::apply(ctx, &target, &eff, &mut st, &mut snaps, &meta);
-        pref.unit.write_state(&st)?;
+        observe::after_command(ctx, lu, &target, &eff, pref.record.adopted, &mut st, &mut snaps)?;
+        lu.write_state(&st)?;
     }
     Ok(SnapResult { project: pref.name().into(), id: Some(meta.id), kind: kind.to_string(), skipped: None })
 }
 
-pub fn container_record(ctx: &Ctx, root: &crate::config::RootCfg, unit: &crate::store::Unit) -> Result<ProjectRecord> {
+pub fn container_record(
+    ctx: &Ctx,
+    root: &crate::config::RootCfg,
+    unit: &crate::store::LockedUnit,
+) -> Result<ProjectRecord> {
     if !ctx.btrfs.is_subvolume(&root.path)? {
         bail!("{} is not a subvolume root; container snapshots are not possible", root.path.display());
     }
@@ -179,8 +181,8 @@ fn snap_container(ctx: &Ctx, root: &crate::config::RootCfg, a: &SnapArgs, kind: 
     let store = ctx.store(root);
     let unit = store.container();
     unit.ensure_dir()?;
-    let _lock = unit.lock(super::lock_timeout(ctx, a.lock_timeout))?;
-    let rec = container_record(ctx, root, &unit)?;
+    let lu = unit.lock(super::lock_timeout(ctx, a.lock_timeout))?;
+    let rec = container_record(ctx, root, &lu)?;
     let snaps = unit.snapshots()?;
     if a.if_changed && {
         ctx.btrfs.sync(&root.path)?;
@@ -302,20 +304,11 @@ fn claude_hook(ctx: &Ctx, _a: &SnapArgs) -> Result<()> {
             args.push("--throttle".into());
             args.push(humantime::format_duration(ctx.cfg.global.hook_throttle).to_string());
         }
-        let exe = std::env::current_exe()?;
-        let mut cmd = if crate::privilege::is_root() || ctx.opts.no_sudo {
-            let mut c = Command::new(exe);
-            c.arg("--no-sudo");
-            c
-        } else {
-            let mut c = Command::new("sudo");
-            c.arg("-n").arg("--").arg(exe).arg("--no-sudo");
-            c
-        };
-        if let Some(cfg) = ctx.opts.config.clone().or_else(|| std::env::var_os("BPM_CONFIG").map(Into::into)) {
-            cmd.arg("--config").arg(cfg);
-        }
-        let status = cmd.args(&args).stdin(Stdio::null()).stdout(Stdio::null()).status();
+        let config = ctx.opts.config.clone().or_else(|| std::env::var_os("BPM_CONFIG").map(Into::into));
+        let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+        let via_sudo = !(crate::privilege::is_root() || ctx.opts.no_sudo);
+        let mut cmd = crate::privilege::self_command(&args, config.as_deref(), via_sudo)?;
+        let status = cmd.stdin(Stdio::null()).stdout(Stdio::null()).status();
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => eprintln!("bpm: hook snapshot of {name} exited with {s}"),

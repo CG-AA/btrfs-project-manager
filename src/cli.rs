@@ -120,6 +120,7 @@ impl Cmd {
             Cmd::Doctor(a) => a.fix,
             Cmd::Hooks { cmd } => matches!(cmd, HooksCmd::Run(_)),
             Cmd::Snap(a) => !a.claude_hook,
+            Cmd::Setup(a) => !a.print_claude_hook,
             _ => true,
         }
     }
@@ -168,8 +169,11 @@ pub struct TickArgs {
     #[arg(long = "project")]
     pub projects: Vec<String>,
     /// Skip heavy operations (adopt, convert, collapse, recompress)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "heavy_only")]
     pub no_heavy: bool,
+    /// Only run the heavy operation this root needs next (the separate bpm-heavy service)
+    #[arg(long)]
+    pub heavy_only: bool,
     /// Wait this long for another tick to finish
     #[arg(long, value_parser = dur, default_value = "0s")]
     pub lock_timeout: Duration,
@@ -299,11 +303,13 @@ pub struct RollbackArgs {
 
 #[derive(Args, Debug)]
 pub struct RmArgs {
-    pub project: String,
-    #[arg(required = true)]
+    /// Project name or path (with --container: the first snapshot)
+    pub project: Option<String>,
+    /// Snapshot selectors
     pub snapshots: Vec<String>,
     #[arg(long)]
     pub force_held: bool,
+    /// Delete snapshots of the root container; every argument is a snapshot
     #[arg(long)]
     pub container: bool,
 }

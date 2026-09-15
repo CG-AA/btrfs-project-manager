@@ -22,6 +22,7 @@ struct ProjectRow {
     newest: Option<u64>,
     newest_age: Option<String>,
     frozen: Option<Vec<String>>,
+    frozen_ref: Option<u64>,
     flags: Vec<String>,
     exclusive_bytes: Option<u64>,
 }
@@ -86,6 +87,7 @@ pub fn run(ctx: &Ctx, a: StatusArgs) -> Result<()> {
                 newest: n.map(|m| m.id),
                 newest_age: n.map(|m| fmt_age(age(now, m.created))),
                 frozen: st.frozen.as_ref().map(|f| f.reasons.clone()),
+                frozen_ref: st.frozen.as_ref().and_then(|f| f.ref_snap),
                 flags,
                 exclusive_bytes: exclusive,
             });
@@ -145,8 +147,9 @@ pub fn run(ctx: &Ctx, a: StatusArgs) -> Result<()> {
                 out.push_str(&t.render());
             }
             for p in r.projects.iter().filter(|p| p.frozen.is_some()) {
+                let good = p.frozen_ref.map(|id| id.to_string()).unwrap_or_else(|| "held".into());
                 out.push_str(&format!(
-                    "\n{} is FROZEN: {}\n  inspect: bpm list {0}; bpm diff {0} held\n  resolve: bpm rollback {0} held   or   bpm unfreeze {0}\n",
+                    "\n{} is FROZEN: {}\n  inspect: bpm list {0}; bpm diff {0} {good}\n  resolve: bpm rollback {0} {good}   or   bpm unfreeze {0}\n",
                     p.name,
                     p.frozen.as_ref().unwrap().join("; ")
                 ));
@@ -154,13 +157,14 @@ pub fn run(ctx: &Ctx, a: StatusArgs) -> Result<()> {
             if !r.unadopted.is_empty() {
                 out.push_str(&format!("\nunadopted (plain directories, not protected): {}\n", r.unadopted.join(", ")));
             }
-            if a.unadopted {
-                if !r.foreign_subvolumes.is_empty() {
-                    out.push_str(&format!("subvolumes not managed by bpm: {}\n", r.foreign_subvolumes.join(", ")));
-                }
-                if !r.ignored.is_empty() {
-                    out.push_str(&format!("ignored: {}\n", r.ignored.join(", ")));
-                }
+            if !r.foreign_subvolumes.is_empty() {
+                out.push_str(&format!(
+                    "subvolumes not managed by bpm (not protected; `bpm adopt <name>` registers them): {}\n",
+                    r.foreign_subvolumes.join(", ")
+                ));
+            }
+            if a.unadopted && !r.ignored.is_empty() {
+                out.push_str(&format!("ignored: {}\n", r.ignored.join(", ")));
             }
             if !r.leftovers.is_empty() {
                 let l: Vec<String> = r.leftovers.iter().map(|p| p.display().to_string()).collect();
@@ -198,14 +202,14 @@ fn detail(ctx: &Ctx, spec: &str) -> Result<()> {
     let live = ctx.btrfs.subvol_info(pref.path()).ok().filter(|i| i.uuid == pref.record.uuid);
     let mut banlist = BTreeMap::new();
     for b in &eff.banlist {
-        let p = pref.path().join(b);
+        let p = b.under_lexical(pref.path());
         let s = match std::fs::symlink_metadata(&p) {
             Err(_) => "absent".to_string(),
             Ok(m) if !m.is_dir() => "not a directory".into(),
             Ok(_) if ctx.btrfs.is_subvolume(&p).unwrap_or(false) => "nested subvolume (excluded)".into(),
             Ok(_) => "PLAIN DIRECTORY (included in snapshots until converted)".into(),
         };
-        banlist.insert(b.clone(), s);
+        banlist.insert(b.to_string(), s);
     }
     let mut unprotected = Vec::new();
     if live.is_some() {
@@ -213,7 +217,7 @@ fn detail(ctx: &Ctx, spec: &str) -> Result<()> {
         while let Some(Ok(e)) = it.next() {
             if crate::util::walk::entry_is_subvol(&e, &|p, i| ctx.is_subvol(p, i)) {
                 let rel = e.path().strip_prefix(pref.path()).unwrap().to_string_lossy().into_owned();
-                if !eff.banlist.contains(&rel) {
+                if !eff.is_banned(&rel) {
                     unprotected.push(rel);
                 }
                 it.skip_current_dir();
