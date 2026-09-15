@@ -405,10 +405,10 @@ fn e2e_nocow_and_cross_entry_hardlinks_adopt() {
          && echo tool > {p}/scripts/tool && ln {p}/scripts/tool {p}/bin/tool && chown -R {}:{} {p}",
         t.uid, t.gid
     ));
-    let sum = sh(&format!("sha256sum {p}/images/disk.img | cut -d' ' -f1")).stdout;
+    let image = fs::read(t.p("vm/images/disk.img")).unwrap();
     t.ok(&["adopt", "vm"]);
     assert_eq!(ino(&t.p("vm")), 256);
-    assert_eq!(sh(&format!("sha256sum {p}/images/disk.img | cut -d' ' -f1")).stdout, sum);
+    assert!(fs::read(t.p("vm/images/disk.img")).unwrap() == image, "NOCOW image copied intact");
     assert_eq!(fs::read_to_string(t.p("vm/bin/tool")).unwrap(), "tool\n");
     assert!(!t.root.join("vm.bpm-old").exists() && !t.root.join("vm.bpm-tmp").exists());
 }
@@ -449,23 +449,28 @@ fn e2e_readonly_snapshot_moves_between_directories() {
 #[test]
 #[ignore]
 fn e2e_project_hook_runs_as_owner_without_groups() {
+    use std::os::unix::fs::PermissionsExt;
     let t = setup!("phook");
-    fs::write(&t.cfg, fs::read_to_string(&t.cfg).unwrap().replace("[global]\n", "[global]\nproject_hooks = \"on\"\n"))
-        .unwrap();
+    let cfg = fs::read_to_string(&t.cfg).unwrap();
+    assert!(cfg.contains("[global]\n"), "config template changed: {cfg}");
+    fs::write(&t.cfg, cfg.replace("[global]\n", "[global]\nproject_hooks = \"on\"\n")).unwrap();
     t.make_project("demo");
     t.ok(&["adopt", "demo"]);
     let dir = t.p("demo/.bpm/hooks/pre-snapshot");
-    let out = t.base.join("hook-out");
+    let out = t.base.join("hook-out.tmp");
+    fs::create_dir_all(&dir).unwrap();
+    let hook = dir.join("10-id");
+    fs::write(&hook, format!("#!/bin/sh\nid -u > '{o}'; id -G >> '{o}'\n", o = out.display())).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    // the hook runs as the owner: it may only write to a file the owner can open
     sh(&format!(
-        "mkdir -p {d} && printf '#!/bin/sh\\nid -u > {o}.tmp; id -G >> {o}.tmp\\n' > {d}/10-id && chmod 755 {d}/10-id \
-         && chown -R {u}:{g} {proj}/.bpm && touch {o}.tmp && chown {u}:{g} {o}.tmp",
-        d = dir.display(),
+        "chown -R {u}:{g} {proj}/.bpm && touch {o} && chown {u}:{g} {o}",
         o = out.display(),
         u = t.uid,
         g = t.gid,
         proj = t.p("demo").display()
     ));
     t.ok(&["snap", "demo"]);
-    let got = fs::read_to_string(format!("{}.tmp", out.display())).unwrap();
+    let got = fs::read_to_string(&out).unwrap();
     assert_eq!(got, format!("{}\n{}\n", t.uid, t.gid), "uid, then only the primary group");
 }

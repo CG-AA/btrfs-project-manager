@@ -409,6 +409,47 @@ fn recompress_keeps_old_snapshot_after_concurrent_change() {
     assert_eq!(env.state("demo").stage, Stage::Active);
 }
 
+/// A file replaced during recompression by one of the same size, mode and mtime (`cp -p`,
+/// `rsync -a`, `mv` of a same-size file) shows only in its directory's mtime; the old snapshot,
+/// the only copy of the previous content, must still be kept.
+fn same_size_replace_during_recompress(rel: &str) {
+    let env = Env::new("");
+    make_project(&env, "demo", 50);
+    fs::write(env.p(&format!("demo/{rel}")), "only copy").unwrap();
+    env.run(&["adopt", "demo"]).unwrap();
+    env.advance(61 * 86400);
+    for _ in 0..3 {
+        env.run(&["tick"]).unwrap();
+        env.advance(600);
+    }
+    let mut st = env.state("demo");
+    st.recompress = None;
+    env.unit("demo").lock(Duration::ZERO).unwrap().write_state(&st).unwrap();
+    let script =
+        format!("cd \"$BPM_PROJECT_PATH\" && printf corrupted > .swap && touch -r {rel} .swap && mv .swap {rel}");
+    let hook = install_hook(&env, "pre-recompress", "10-user", &script);
+    env.run(&["tick"]).unwrap();
+    fs::remove_file(hook).unwrap();
+    assert!(env.fake.ops().iter().any(|o| o.starts_with("defrag")), "recompress ran");
+    let kept = env.snaps("demo").iter().any(|m| snap_read(&env, "demo", m.id, rel).as_deref() == Some("only copy"));
+    assert!(kept, "{rel}: {}", describe(&env, "demo"));
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    let kept = env.snaps("demo").iter().any(|m| snap_read(&env, "demo", m.id, rel).as_deref() == Some("only copy"));
+    assert!(kept, "{rel}: {}", describe(&env, "demo"));
+    assert_eq!(env.state("demo").stage, Stage::Active, "the replacement counts as activity");
+}
+
+#[test]
+fn recompress_keeps_old_snapshot_after_same_size_replace_in_dir() {
+    same_size_replace_during_recompress("src/important.txt");
+}
+
+#[test]
+fn recompress_keeps_old_snapshot_after_same_size_replace_at_root() {
+    same_size_replace_during_recompress("important.txt");
+}
+
 // ---------------- no path resolution through symlinks ----------------
 
 fn victim_files(env: &Env, dir: &str) -> Vec<String> {

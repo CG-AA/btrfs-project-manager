@@ -190,6 +190,10 @@ impl FakeBtrfs {
 fn fingerprint(root: &Path, subvols: &HashSet<(u64, u64)>) -> u64 {
     let probe = |p: &Path, _ino: u64| key_of(p).map(|k| subvols.contains(&k)).unwrap_or(false);
     let mut h = DefaultHasher::new();
+    // the root's mtime is not in the index; a rename at the top level changes nothing else
+    if let Ok(md) = std::fs::symlink_metadata(root) {
+        walk::nanos(md.mtime(), md.mtime_nsec()).hash(&mut h);
+    }
     if let Ok(idx) = walk::tree_index(root, &probe) {
         for (path, e) in idx {
             path.hash(&mut h);
@@ -237,6 +241,11 @@ fn copy_tree(src: &Path, dst: &Path, subvols: &HashSet<(u64, u64)>) -> Result<()
         if ft.is_dir() {
             std::fs::create_dir_all(&target)?;
             std::fs::set_permissions(&target, std::fs::Permissions::from_mode(md.mode() & 0o7777))?;
+            if probe(entry.path(), 0) {
+                // a placeholder: the kernel gives it the time its inode is instantiated, not the
+                // nested subvolume's times, so it differs between snapshots of the same state
+                continue;
+            }
         } else if ft.is_symlink() {
             std::os::unix::fs::symlink(std::fs::read_link(entry.path())?, &target)?;
         } else if ft.is_file() {
@@ -249,6 +258,7 @@ fn copy_tree(src: &Path, dst: &Path, subvols: &HashSet<(u64, u64)>) -> Result<()
     for (target, md) in copied.iter().rev() {
         set_times(target, md)?;
     }
+    set_times(dst, &std::fs::symlink_metadata(src)?)?;
     Ok(())
 }
 

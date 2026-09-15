@@ -130,7 +130,7 @@ pub fn tree_stats(
     Ok(st)
 }
 
-fn nanos(sec: i64, nsec: i64) -> i128 {
+pub fn nanos(sec: i64, nsec: i64) -> i128 {
     sec as i128 * 1_000_000_000 + nsec as i128
 }
 
@@ -172,15 +172,16 @@ pub struct EntryInfo {
 /// Map of relative path -> entry info, not crossing nested subvolumes.
 pub fn tree_index(root: &Path, probe: SubvolProbe) -> Result<BTreeMap<PathBuf, EntryInfo>> {
     let mut map = BTreeMap::new();
-    let walker =
-        WalkDir::new(root).follow_links(false).sort_by_file_name().into_iter().filter_entry(|e| !nested(e, probe));
-    for entry in walker {
+    let mut it = WalkDir::new(root).follow_links(false).sort_by_file_name().min_depth(1).into_iter();
+    while let Some(entry) = it.next() {
         let entry = entry?;
-        if entry.depth() == 0 {
-            continue;
-        }
         let md = entry.metadata()?;
         let ft = entry.file_type();
+        // one lstat per entry: the subvolume test reuses it instead of a `filter_entry` probe
+        if ft.is_dir() && probe(entry.path(), md.ino()) {
+            it.skip_current_dir();
+            continue;
+        }
         let kind = if ft.is_dir() {
             EntryKind::Dir
         } else if ft.is_symlink() {

@@ -11,10 +11,12 @@ use crate::policy::{change, thin};
 use crate::project::ProjectRef;
 use crate::store::journal::Journal;
 use crate::store::{LockedUnit, ProjectState, RecompressRecord, SnapshotKind, SnapshotMeta, newest};
+use crate::util::walk::{self, EntryInfo, EntryKind};
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -125,12 +127,12 @@ fn zstd_len(data: &[u8], level: u8) -> Result<usize> {
 }
 
 /// Estimate the gain of recompressing at `level` over zstd:1 from a sample of files.
-pub fn sample_gain(ctx: &Ctx, live: &Path, exclude: &[std::path::PathBuf], level: u8) -> Result<f64> {
+pub fn sample_gain(ctx: &Ctx, live: &Path, exclude: &[PathBuf], level: u8) -> Result<f64> {
     let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
     let mut files = Vec::new();
     let walker = walkdir::WalkDir::new(live).follow_links(false).into_iter().filter_entry(|e| {
         let rel = e.path().strip_prefix(live).unwrap_or(e.path());
-        !(e.depth() > 0 && (exclude.iter().any(|x| x == rel) || crate::util::walk::entry_is_subvol(e, &probe)))
+        !(e.depth() > 0 && (exclude.iter().any(|x| x == rel) || walk::entry_is_subvol(e, &probe)))
     });
     for e in walker.flatten().filter(|e| e.file_type().is_file()).take(20_000) {
         if e.metadata().map(|m| m.len() >= 4096).unwrap_or(false) {
@@ -154,8 +156,24 @@ pub fn sample_gain(ctx: &Ctx, live: &Path, exclude: &[std::path::PathBuf], level
     Ok(if base == 0 { 0.0 } else { 1.0 - high as f64 / base as f64 })
 }
 
-/// What a defragment must not change about an entry: kind, size, mtime (files), mode.
-type EntryKey = (crate::util::walk::EntryKind, u64, i128, u32);
+/// What a defragment must not change about an entry: kind, size, mtime, mode.
+type EntryKey = (EntryKind, u64, Option<i128>, u32);
+
+/// Listing keys of a snapshot tree, in path order.
+///
+/// The mtime of an empty directory is left out: a nested subvolume's placeholder is an empty
+/// directory whose mtime is the moment the kernel instantiated its inode, so it differs between
+/// walks. Non-empty directories keep theirs: replacing a file by one with the same size, mode and
+/// mtime (`cp -p`, `rsync -a`, `tar -x`) shows only in the parent directory's mtime.
+fn listing_keys(idx: BTreeMap<PathBuf, EntryInfo>) -> impl Iterator<Item = (PathBuf, EntryKey)> {
+    let mut it = idx.into_iter().peekable();
+    std::iter::from_fn(move || {
+        let (path, e) = it.next()?;
+        let has_children = it.peek().is_some_and(|(next, _)| next.starts_with(&path));
+        let mtime = (e.kind != EntryKind::Dir || has_children).then_some(e.mtime_ns);
+        Some((path, (e.kind, e.size, mtime, e.mode)))
+    })
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RecompressReport {
@@ -278,18 +296,16 @@ pub fn recompress(
     // the snapshots before and after was changed by someone else during the defragment: keep the
     // old snapshot (the only copy of the previous state) and count the change as activity.
     let probe = |p: &Path, ino: u64| ctx.is_subvol(p, ino);
-    let listing = |id: u64| -> Result<Vec<(std::path::PathBuf, EntryKey)>> {
-        Ok(crate::util::walk::tree_index(&pref.unit.snapshot_path(id), &probe)?
-            .into_iter()
-            // directory mtimes are left out: a change of entries already shows in the listing,
-            // and a nested subvolume's placeholder gets a fresh mtime in every snapshot
-            .map(|(k, v)| {
-                let mtime = if v.kind == crate::util::walk::EntryKind::Dir { 0 } else { v.mtime_ns };
-                (k, (v.kind, v.size, mtime, v.mode))
-            })
-            .collect())
+    // the root's own mtime is not in the index: it is what a replacement at the top level changes
+    let index = |id: u64| -> Result<(i128, BTreeMap<PathBuf, EntryInfo>)> {
+        use std::os::unix::fs::MetadataExt;
+        let path = pref.unit.snapshot_path(id);
+        let md = std::fs::symlink_metadata(&path)?;
+        Ok((walk::nanos(md.mtime(), md.mtime_nsec()), walk::tree_index(&path, &probe)?))
     };
-    let untouched = listing(old.id)? == listing(m.id)?;
+    let (root_before, before) = index(old.id)?;
+    let (root_after, after_idx) = index(m.id)?;
+    let untouched = root_before == root_after && listing_keys(before).eq(listing_keys(after_idx));
     ctx.btrfs.sync(&live)?;
     let after = ctx.btrfs.subvol_info(&live)?;
     if !untouched {
