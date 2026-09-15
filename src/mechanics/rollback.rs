@@ -9,7 +9,7 @@ use crate::error::refused;
 use crate::hooks::{self, HookCtx, HookEvent};
 use crate::project::ProjectRef;
 use crate::store::journal::Journal;
-use crate::store::{SnapshotKind, SnapshotMeta};
+use crate::store::{LockedUnit, SnapshotKind, SnapshotMeta};
 use crate::util::fs::{lchown, rename_exchange, rename_strict, safe_relative, sibling};
 use crate::util::relpath::RelPath;
 use crate::util::{proc, walk};
@@ -200,6 +200,7 @@ fn materialize(ctx: &Ctx, pref: &ProjectRef, meta: &SnapshotMeta, live: &Path) -
 
 pub fn rollback(
     ctx: &Ctx,
+    lu: &LockedUnit,
     pref: &mut ProjectRef,
     eff: &EffectiveConfig,
     meta: &SnapshotMeta,
@@ -291,7 +292,7 @@ pub fn rollback(
     let old_uuid = pref.record.uuid;
     pref.record.uuid_history.push(old_uuid);
     pref.record.uuid = info.uuid;
-    pref.unit.write_record(&pref.record)?;
+    lu.write_record(&pref.record)?;
     journal.step(6)?;
     // checked before nested subvolumes are moved out (which changes the aside's counters)
     let unchanged = retire::prove(ctx, &aside, &Expect::Snapshot { kept: &safety }, &nested).map(|_| ());
@@ -373,7 +374,7 @@ fn keep_aside(ctx: &Ctx, aside: &Path, why: &str) -> Result<Option<PathBuf>> {
 }
 
 /// Recreate a deleted (orphaned) or archived project from a snapshot.
-pub fn recreate(ctx: &Ctx, pref: &mut ProjectRef, meta: &SnapshotMeta) -> Result<String> {
+pub fn recreate(ctx: &Ctx, lu: &LockedUnit, pref: &mut ProjectRef, meta: &SnapshotMeta) -> Result<String> {
     let live = pref.path().to_path_buf();
     if live.symlink_metadata().is_ok() {
         return Err(refused(format!("{} exists; use `bpm rollback` instead", live.display())));
@@ -389,6 +390,6 @@ pub fn recreate(ctx: &Ctx, pref: &mut ProjectRef, meta: &SnapshotMeta) -> Result
         pref.record.uuid_history.push(old);
     }
     pref.record.uuid = info.uuid;
-    pref.unit.write_record(&pref.record)?;
+    lu.write_record(&pref.record)?;
     Ok(info.uuid.to_string())
 }

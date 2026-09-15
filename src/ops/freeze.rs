@@ -13,7 +13,7 @@ use anyhow::Result;
 
 pub fn freeze(ctx: &Ctx, a: FreezeArgs) -> Result<()> {
     let pref = project::resolve(ctx, &a.project)?;
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let mut st = pref.unit.read_state()?;
     let snaps = pref.unit.snapshots()?;
     if st.frozen.is_some() {
@@ -25,7 +25,7 @@ pub fn freeze(ctx: &Ctx, a: FreezeArgs) -> Result<()> {
         trigger_snap: None,
         ref_snap: newest(&snaps).map(|m| m.id),
     });
-    pref.unit.write_state(&st)?;
+    lu.write_state(&st)?;
     emit(ctx, &st.frozen, || {
         format!("{}: frozen; no snapshot older than now will be deleted automatically", pref.name())
     });
@@ -34,7 +34,7 @@ pub fn freeze(ctx: &Ctx, a: FreezeArgs) -> Result<()> {
 
 pub fn unfreeze(ctx: &Ctx, a: UnfreezeArgs) -> Result<()> {
     let pref = project::resolve(ctx, &a.project)?;
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let mut st = pref.unit.read_state()?;
     let Some(f) = st.frozen.clone() else {
         return Err(refused(format!("{} is not frozen", pref.name())));
@@ -53,7 +53,7 @@ pub fn unfreeze(ctx: &Ctx, a: UnfreezeArgs) -> Result<()> {
         (Some(live), Some(n)) if change::identical(&live, &n) => {
             if n.stats.is_none() {
                 let mut n = n;
-                snapshot::count_stats(ctx, &target, &mut n, eff.policy.snapshot.stats_budget)?;
+                snapshot::count_stats(ctx, &lu, &target, &mut n, eff.policy.snapshot.stats_budget)?;
                 if let Some(slot) = snaps.iter_mut().find(|m| m.id == n.id) {
                     *slot = n;
                 }
@@ -87,12 +87,12 @@ pub fn unfreeze(ctx: &Ctx, a: UnfreezeArgs) -> Result<()> {
                 let mut m = m.clone();
                 m.hold = false;
                 m.hold_note.clear();
-                pref.unit.update_meta(&m)?;
+                lu.update_meta(&m)?;
                 released.push(m.id);
             }
         }
     }
-    pref.unit.write_state(&st)?;
+    lu.write_state(&st)?;
     emit(ctx, &serde_json::json!({"project": pref.name(), "was": f, "released_holds": released}), || {
         let mut s = format!(
             "{}: unfrozen (was: {}). The current state is the new shrink-guard reference.",

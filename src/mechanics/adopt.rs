@@ -45,7 +45,7 @@ pub struct AdoptReport {
 const MIN_FREE: u64 = 2 << 30;
 
 /// Move an orphaned store unit out of the way of a new project with the same name.
-fn clear_name(store: &Store, name: &str, live_uuid: Option<crate::btrfs::Uuid>) -> Result<()> {
+fn clear_name(store: &Store, name: &str, live_uuid: Option<crate::btrfs::Uuid>, lock_timeout: Duration) -> Result<()> {
     let unit = store.unit(name);
     let Some(rec) = unit.read_record()? else {
         return Ok(());
@@ -60,10 +60,10 @@ fn clear_name(store: &Store, name: &str, live_uuid: Option<crate::btrfs::Uuid>) 
     }
     tracing::warn!("store entry for a previous {name} (uuid {}) moved to {new_name}", rec.uuid);
     if !store.dry_run {
-        std::fs::rename(&unit.dir, &target.dir)?;
+        let moved = unit.lock(lock_timeout)?.rename_to(target)?;
         let mut rec = rec;
         rec.name = new_name;
-        target.write_record(&rec)?;
+        moved.write_record(&rec)?;
     }
     Ok(())
 }
@@ -140,7 +140,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
             );
         }
     }
-    clear_name(&store, name, live_uuid)?;
+    clear_name(&store, name, live_uuid, ctx.cfg.global.lock_timeout)?;
     let owner = (md.uid(), md.gid());
     hooks::run(
         ctx,
@@ -173,8 +173,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
         });
     }
 
-    let unit = store.unit(name);
-    unit.ensure_dir()?;
+    let unit = store.unit(name).lock(ctx.cfg.global.lock_timeout)?;
     let mut journal = Journal::begin(&unit.dir, "adopt", &[("path", path.display().to_string())], false)?;
     let keep_build = o.keep_build.unwrap_or(eff.policy.keep_build_on_adopt);
     // compared with file timestamps, so the real clock
@@ -308,7 +307,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
     let info = ctx.btrfs.subvol_info(&path)?;
     let record = ProjectRecord::new(name, &path, info.uuid, owner.0, owner.1, ctx.now());
     unit.write_record(&record)?;
-    let pref = ProjectRef { root: root.clone(), store: store.clone(), unit: unit.clone(), record: record.clone() };
+    let pref = ProjectRef { root: root.clone(), store: store.clone(), unit: (*unit).clone(), record: record.clone() };
     let mut st = ProjectState::default();
     st.banlist_seen.extend(nested_made.iter().cloned());
     let ban = super::banlist::enforce_cheap(ctx, &path, &eff, &mut st, owner, true)?;

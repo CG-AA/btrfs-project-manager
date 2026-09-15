@@ -10,7 +10,7 @@ use crate::config::EffectiveConfig;
 use crate::ctx::Ctx;
 use crate::hooks::{self, HookCtx, HookEvent};
 use crate::policy::{change, lifecycle, shrink};
-use crate::store::{ProjectState, SnapshotMeta, Stage, newest};
+use crate::store::{LockedUnit, ProjectState, SnapshotMeta, Stage, newest};
 use crate::util::time::age;
 use anyhow::Result;
 use jiff::Timestamp;
@@ -142,8 +142,10 @@ pub fn want_stats(eff: &EffectiveConfig, st: &ProjectState, snaps: &[SnapshotMet
 
 /// Evaluate the shrink guard on the newest snapshot unless that already happened, counting it
 /// first when `walk` allows. Returns true when the guard froze the project.
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate_guard(
     ctx: &Ctx,
+    lu: &LockedUnit,
     t: &Target,
     eff: &EffectiveConfig,
     st: &mut ProjectState,
@@ -166,7 +168,7 @@ pub fn evaluate_guard(
         if !go {
             return false;
         }
-        if let Err(e) = count_stats(ctx, t, &mut n, eff.policy.snapshot.stats_budget) {
+        if let Err(e) = count_stats(ctx, lu, t, &mut n, eff.policy.snapshot.stats_budget) {
             tracing::warn!("{}: {e:#}", t.name);
             return false;
         }
@@ -175,7 +177,7 @@ pub fn evaluate_guard(
             *slot = n.clone();
         }
     }
-    guard::apply(ctx, t, eff, st, snaps, &n)
+    guard::apply(ctx, lu, t, eff, st, snaps, &n)
 }
 
 /// Retention and collapse may delete snapshots only once the guard has seen the newest one:
@@ -188,6 +190,7 @@ pub fn thin_allowed(st: &ProjectState, snaps: &[SnapshotMeta]) -> bool {
 /// update the stage and evaluate the guard on snapshots that already have stats.
 pub fn after_command(
     ctx: &Ctx,
+    lu: &LockedUnit,
     t: &Target,
     eff: &EffectiveConfig,
     adopted: Timestamp,
@@ -199,5 +202,5 @@ pub fn after_command(
     let live = ctx.btrfs.subvol_info(t.live)?;
     note_live(st, &live, now);
     update_stage(ctx, t, eff, adopted, st, now);
-    Ok(evaluate_guard(ctx, t, eff, st, snaps, now, Walk::Never))
+    Ok(evaluate_guard(ctx, lu, t, eff, st, snaps, now, Walk::Never))
 }

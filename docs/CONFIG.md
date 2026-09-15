@@ -48,7 +48,7 @@ alone (and stays in snapshots). The same applies to paths given to `bpm restore`
 |---|---|---|
 | `path` | required | absolute path, ideally a subvolume root |
 | `ignore` | `[]` | top-level names that are never projects (they stay in container snapshots) |
-| `adopt` | `"manual"` (`"auto"` in the default file) | `auto`: tick adopts new top-level directories, one per tick |
+| `adopt` | `"manual"` (`"auto"` in the default file) | `auto`: new top-level directories and subvolumes are adopted, one at a time; one that keeps failing is retried after 1 h, doubling up to a day |
 | `adopt_min_age` | `"15m"` | a new directory must be untouched this long before auto-adoption |
 | `banlist_add` | `[]` | added to every project in this root |
 | `policy` | `{}` | policy overrides for this root |

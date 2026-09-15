@@ -4,7 +4,7 @@ use super::Target;
 use crate::ctx::Ctx;
 use crate::error::refused;
 use crate::hooks::{self, HookCtx, HookEvent};
-use crate::store::{KindClass, ProjectRecord, SnapshotKind, SnapshotMeta, Unit, newest};
+use crate::store::{KindClass, LockedUnit, ProjectRecord, SnapshotKind, SnapshotMeta, Unit, newest};
 use crate::util::walk;
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
@@ -144,7 +144,7 @@ pub fn take(ctx: &Ctx, t: &Target, o: &SnapOpts) -> Result<SnapshotMeta> {
             stats,
             origin: ctx.origin(),
         };
-        t.unit.write_meta(&tmp, &meta)?;
+        t.unit.write_new_meta(&tmp, &meta)?;
         std::fs::rename(&tmp, &final_dir)
             .with_context(|| format!("rename {} -> {}", tmp.display(), final_dir.display()))?;
         if let Ok(d) = std::fs::File::open(&t.unit.dir) {
@@ -169,13 +169,13 @@ pub fn take(ctx: &Ctx, t: &Target, o: &SnapOpts) -> Result<SnapshotMeta> {
 
 /// Count files and bytes of an existing (read-only) snapshot and store them in its metadata.
 /// Used for snapshots taken without stats, so the shrink guard can still evaluate them.
-pub fn count_stats(ctx: &Ctx, t: &Target, meta: &mut SnapshotMeta, budget: Duration) -> Result<()> {
+pub fn count_stats(ctx: &Ctx, lu: &LockedUnit, t: &Target, meta: &mut SnapshotMeta, budget: Duration) -> Result<()> {
     let path = t.unit.snapshot_path(meta.id);
     let probe = |p: &std::path::Path, ino: u64| ctx.is_subvol(p, ino);
     let stats = walk::tree_stats(&path, &probe, &t.stats_exclude, &t.sentinels, budget)
         .with_context(|| format!("count snapshot #{}", meta.id))?;
     meta.stats = Some(stats);
-    t.unit.update_meta(meta)
+    lu.update_meta(meta)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,7 +189,7 @@ pub enum DeleteMode {
 /// Prove the snapshot belongs to this unit's project, then delete it.
 pub fn delete(
     ctx: &Ctx,
-    unit: &Unit,
+    unit: &LockedUnit,
     record: &ProjectRecord,
     snaps: &[SnapshotMeta],
     meta: &SnapshotMeta,

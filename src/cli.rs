@@ -168,8 +168,11 @@ pub struct TickArgs {
     #[arg(long = "project")]
     pub projects: Vec<String>,
     /// Skip heavy operations (adopt, convert, collapse, recompress)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "heavy_only")]
     pub no_heavy: bool,
+    /// Only run the heavy operation this root needs next (the separate bpm-heavy service)
+    #[arg(long)]
+    pub heavy_only: bool,
     /// Wait this long for another tick to finish
     #[arg(long, value_parser = dur, default_value = "0s")]
     pub lock_timeout: Duration,

@@ -105,18 +105,20 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
             d.error(format!("{tool} not found"), None);
         }
     }
-    let timer = Command::new("systemctl")
-        .args(["is-enabled", "bpm.timer"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    if timer == "enabled" {
-        d.ok("bpm.timer enabled");
-    } else {
-        d.warn(
-            format!("bpm.timer is {}", if timer.is_empty() { "not installed".into() } else { timer }),
-            Some("bpm setup".into()),
-        );
+    for unit in super::setup::TIMERS {
+        let state = Command::new("systemctl")
+            .args(["is-enabled", unit])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        if state == "enabled" {
+            d.ok(format!("{unit} enabled"));
+        } else {
+            d.warn(
+                format!("{unit} is {}", if state.is_empty() { "not installed".into() } else { state }),
+                Some("bpm setup".into()),
+            );
+        }
     }
     for root in ctx.roots() {
         let store = ctx.store(&root);
@@ -490,6 +492,7 @@ fn check_unit(d: &mut Doc, unit: &Unit) {
 }
 
 fn recover_meta(ctx: &Ctx, unit: &Unit, id: u64, path: &Path) -> Result<()> {
+    let unit = unit.lock(std::time::Duration::ZERO)?;
     let info = ctx.btrfs.subvol_info(path)?;
     let meta = SnapshotMeta {
         format: 1,
@@ -509,7 +512,7 @@ fn recover_meta(ctx: &Ctx, unit: &Unit, id: u64, path: &Path) -> Result<()> {
         stats: None,
         origin: ctx.origin(),
     };
-    unit.write_meta(&unit.snapshot_dir(id), &meta)
+    unit.write_meta_in(&unit.snapshot_dir(id), &meta)
 }
 
 fn check_claude_hook(d: &mut Doc) {

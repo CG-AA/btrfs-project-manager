@@ -8,7 +8,7 @@ use anyhow::Result;
 
 pub fn run(ctx: &Ctx, a: HoldArgs, hold: bool) -> Result<()> {
     let pref = project::resolve(ctx, &a.project)?;
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let snaps = pref.unit.snapshots()?;
     let mut changed = Vec::new();
     for sel in &a.snapshots {
@@ -20,7 +20,7 @@ pub fn run(ctx: &Ctx, a: HoldArgs, hold: bool) -> Result<()> {
             } else {
                 String::new()
             };
-            pref.unit.update_meta(&m)?;
+            lu.update_meta(&m)?;
             changed.push(m.id);
         }
     }

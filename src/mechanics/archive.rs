@@ -248,7 +248,7 @@ pub fn receive(ctx: &Ctx, pref: &ProjectRef, archive: &Path, manifest: &Manifest
             argv: ctx.invoker.argv.clone(),
         },
     };
-    unit.write_meta(&tmp, &meta)?;
+    unit.write_new_meta(&tmp, &meta)?;
     std::fs::rename(&tmp, unit.snapshot_dir(id))?;
     Ok(meta)
 }

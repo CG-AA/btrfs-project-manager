@@ -56,13 +56,14 @@ fn tick_snapshot_without_stats_is_guarded_before_thinning() {
     make_rust_project(&env, "demo");
     env.advance(10);
     env.run(&["adopt", "demo"]).unwrap();
-    let unit = env.unit("demo");
+    let unit = env.unit("demo").lock(Duration::ZERO).unwrap();
     let mut m = env.snaps("demo")[0].clone();
     m.stats.as_mut().unwrap().walk_ms = 5000; // pretend counting is slow
     unit.update_meta(&m).unwrap();
     let mut st = env.state("demo");
     st.last_stats_at = Some(env.clock_now());
     unit.write_state(&st).unwrap();
+    drop(unit);
     fs::write(env.p("demo/src/src1.txt"), "edit").unwrap();
     env.advance(600);
     env.run(&["tick"]).unwrap();
@@ -397,7 +398,7 @@ fn recompress_keeps_old_snapshot_after_concurrent_change() {
     }
     let mut st = env.state("demo");
     st.recompress = None;
-    env.unit("demo").write_state(&st).unwrap();
+    env.unit("demo").lock(Duration::ZERO).unwrap().write_state(&st).unwrap();
     let hook = install_hook(&env, "pre-recompress", "10-user", "rm -f \"$BPM_PROJECT_PATH/important.txt\"");
     env.run(&["tick"]).unwrap();
     fs::remove_file(hook).unwrap();
@@ -504,4 +505,144 @@ fn restore_refuses_symlinked_parent() {
     std::os::unix::fs::symlink(&outside, env.p("demo/web")).unwrap();
     assert!(env.run(&["restore", "demo", &id, "web/config/snapcfg0.txt", "--overwrite"]).is_err());
     assert_eq!(fs::read_to_string(outside.join("app.toml")).unwrap(), "system file outside project");
+}
+
+// ---------------- store and tick robustness ----------------
+
+/// `mv app app-old && mv app-v2 app`: each store unit keeps its own project.
+#[test]
+fn rename_chain_keeps_each_history_with_its_project() {
+    let env = Env::new("");
+    make_rust_project(&env, "app");
+    make_rust_project(&env, "app-v2");
+    env.advance(10);
+    env.run(&["adopt", "app"]).unwrap();
+    env.run(&["adopt", "app-v2"]).unwrap();
+    let ua = env.unit("app").read_record().unwrap().unwrap().uuid;
+    let ub = env.unit("app-v2").read_record().unwrap().unwrap().uuid;
+    fs::rename(env.p("app"), env.p("app-old")).unwrap();
+    fs::rename(env.p("app-v2"), env.p("app")).unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    let labels = [(ua, "A"), (ub, "B")];
+    let mut units = env.units_by_uuid(&labels);
+    units.sort();
+    assert_eq!(
+        units,
+        vec![("app".into(), "B".into(), vec!["B".into()]), ("app-old".into(), "A".into(), vec!["A".into()])],
+    );
+    fs::write(env.p("app/src/src0.txt"), "v2 edit").unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    assert_eq!(env.snaps("app").len(), 2, "the renamed project is still snapshotted");
+}
+
+/// Swapping two project names.
+#[test]
+fn rename_swap_keeps_each_history_with_its_project() {
+    let env = Env::new("");
+    make_rust_project(&env, "a");
+    make_rust_project(&env, "b");
+    env.advance(10);
+    env.run(&["adopt", "a"]).unwrap();
+    env.run(&["adopt", "b"]).unwrap();
+    let ua = env.unit("a").read_record().unwrap().unwrap().uuid;
+    let ub = env.unit("b").read_record().unwrap().unwrap().uuid;
+    fs::rename(env.p("a"), env.p("t")).unwrap();
+    fs::rename(env.p("b"), env.p("a")).unwrap();
+    fs::rename(env.p("t"), env.p("b")).unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    let mut units = env.units_by_uuid(&[(ua, "A"), (ub, "B")]);
+    units.sort();
+    assert_eq!(units, vec![("a".into(), "B".into(), vec!["B".into()]), ("b".into(), "A".into(), vec!["A".into()])]);
+    let rec = env.unit("a").read_record().unwrap().unwrap();
+    assert_eq!(rec.path, env.p("a"));
+}
+
+/// A long `btrfs receive` holds the unit lock; tick cleanup must not delete its tmp dir.
+#[test]
+fn cleanup_skips_units_that_are_busy() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    env.run(&["adopt", "demo"]).unwrap();
+    let unit = env.unit("demo");
+    let lock = unit.lock(Duration::from_secs(1)).unwrap();
+    let tmp = unit.dir.join("9.tmp");
+    fs::create_dir(&tmp).unwrap();
+    env.fake.create_subvolume(&tmp.join("snapshot")).unwrap();
+    fs::write(tmp.join("snapshot/receiving"), "x").unwrap();
+    fs::File::open(&tmp).unwrap().set_modified(std::time::SystemTime::now() - Duration::from_secs(7200)).unwrap();
+    env.advance(600);
+    env.run(&["tick", "--no-heavy"]).unwrap();
+    assert!(tmp.join("snapshot/receiving").exists());
+    drop(lock);
+}
+
+/// A directory whose adoption is always refused backs off and does not starve collapse.
+#[test]
+fn refused_adoption_does_not_starve_collapse() {
+    let env = Env::new("[defaults.lifecycle]\ncold_after = \"20d\"\n");
+    make_project(&env, "demo", 20);
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::write(env.p("demo/src/src0.txt"), "x").unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    env.auto_adopt();
+    fs::create_dir_all(env.p("vm")).unwrap();
+    fs::write(env.p("vm/readme"), "x").unwrap();
+    env.fake.create_subvolume(&env.p("vm/disk")).unwrap();
+    env.advance(21 * 86400);
+    for _ in 0..6 {
+        env.run(&["tick"]).ok();
+        env.advance(300);
+    }
+    assert_eq!(env.snaps("demo").len(), 1, "{}", describe(&env, "demo"));
+}
+
+/// `tick --heavy-only` runs the heavy operation the light tick found, and `--no-heavy` does not.
+#[test]
+fn heavy_operations_run_in_their_own_pass() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    write_files(&env.p("demo/cmake-build-debug"), 3, "o");
+    fs::write(env.p("demo/CMakeLists.txt"), "").unwrap();
+    env.advance(600);
+    env.run(&["tick", "--no-heavy"]).unwrap();
+    assert!(!env.state("demo").pending_convert.is_empty());
+    env.advance(600);
+    env.run(&["tick", "--no-heavy"]).unwrap();
+    assert!(!env.fake.is_subvolume(&env.p("demo/cmake-build-debug")).unwrap());
+    env.run(&["tick", "--heavy-only"]).unwrap();
+    assert!(env.fake.is_subvolume(&env.p("demo/cmake-build-debug")).unwrap());
+    assert!(env.p("demo/cmake-build-debug/o0.txt").exists());
+}
+
+/// Snapshots still happen while a heavy operation holds its lock.
+#[test]
+fn light_tick_runs_while_heavy_lock_is_held() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    let heavy = env.store().heavy_lock().unwrap();
+    fs::write(env.p("demo/src/src0.txt"), "edit").unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    assert_eq!(env.snaps("demo").len(), 2);
+    drop(heavy);
+}
+
+/// A subvolume at the top level (for example after `bpm forget`) is adopted again.
+#[test]
+fn foreign_subvolume_is_auto_adopted() {
+    let env = Env::new("");
+    env.auto_adopt();
+    env.fake.create_subvolume(&env.p("newproj")).unwrap();
+    write_files(&env.p("newproj/src"), 3, "s");
+    env.advance(3600);
+    env.run(&["tick"]).unwrap();
+    assert!(env.unit("newproj").read_record().unwrap().is_some());
+    assert!(!env.snaps("newproj").is_empty());
 }

@@ -6,7 +6,7 @@ use crate::config::EffectiveConfig;
 use crate::ctx::Ctx;
 use crate::hooks::{self, HookCtx, HookEvent};
 use crate::policy::shrink;
-use crate::store::{Frozen, ProjectState, RefStats, SnapshotMeta};
+use crate::store::{Frozen, LockedUnit, ProjectState, RefStats, SnapshotMeta};
 
 /// How many snapshots without stats, between the last counted one and the trigger, are walked
 /// when looking for the last good state.
@@ -15,6 +15,7 @@ const MAX_UNCOUNTED_CANDIDATES: usize = 5;
 /// Evaluate `new` (normally the newest snapshot). Returns true when it tripped the guard.
 pub fn apply(
     ctx: &Ctx,
+    lu: &LockedUnit,
     t: &Target,
     eff: &EffectiveConfig,
     st: &mut ProjectState,
@@ -60,12 +61,12 @@ pub fn apply(
         }
         return false;
     }
-    let last_good_id = last_good(ctx, t, eff, snaps, &reference, prev.as_ref(), new.id);
+    let last_good_id = last_good(ctx, lu, t, eff, snaps, &reference, prev.as_ref(), new.id);
     if let Some(lg) = last_good_id.and_then(|id| snaps.iter_mut().find(|m| m.id == id)) {
         if !lg.hold {
             lg.hold = true;
             lg.hold_note = format!("auto-held: last state before shrink detected in #{}", new.id);
-            if let Err(e) = t.unit.update_meta(lg) {
+            if let Err(e) = lu.update_meta(lg) {
                 tracing::error!("{}: could not hold snapshot #{}: {e:#}", t.name, lg.id);
             }
         }
@@ -128,8 +129,10 @@ pub fn apply(
 /// The newest snapshot before `trigger` that passes the guard. Snapshots taken without stats
 /// (hook snapshots, throttled counts) often already contain the loss, so they are counted and
 /// checked instead of being trusted for being "the previous one".
+#[allow(clippy::too_many_arguments)]
 fn last_good(
     ctx: &Ctx,
+    lu: &LockedUnit,
     t: &Target,
     eff: &EffectiveConfig,
     snaps: &mut [SnapshotMeta],
@@ -142,7 +145,7 @@ fn last_good(
     between.sort_by_key(|&i| std::cmp::Reverse(snaps[i].id));
     for i in between.into_iter().take(MAX_UNCOUNTED_CANDIDATES) {
         if snaps[i].stats.is_none() {
-            if let Err(e) = count_stats(ctx, t, &mut snaps[i], eff.policy.snapshot.stats_budget) {
+            if let Err(e) = count_stats(ctx, lu, t, &mut snaps[i], eff.policy.snapshot.stats_budget) {
                 tracing::warn!("{}: {e:#}", t.name);
                 continue;
             }

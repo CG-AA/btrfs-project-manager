@@ -14,7 +14,10 @@ directory. The steps below hand `/space` to bpm. snapper keeps managing `/`, `/h
    ```
 
    `setup` creates `/etc/bpm/config.toml` (review `ignore`, and `adopt = "auto"` in `[[root]]`),
-   the store subvolume `/space/.bpm`, and enables `bpm.timer`. The first tick takes a container
+   the store subvolume `/space/.bpm`, and enables two timers: `bpm.timer` (snapshots, shrink guard,
+   retention, every 5 minutes) and `bpm-heavy.timer` (one adopt, build-dir conversion, collapse or
+   recompression at a time). A long adoption or recompression never delays snapshots of other
+   projects. The units use the config file `setup` was run with. The first tick takes a container
    snapshot of `/space`, which still protects every not-yet-adopted directory.
 
 2. Stop snapper's timeline for `/space`.
@@ -126,7 +129,7 @@ directory was inside. Compare it with the project, copy back what you need, then
 
 ## Checks after deployment
 
-- `bpm doctor` shows no `ERROR`, and `systemctl list-timers bpm.timer` lists the timer.
+- `bpm doctor` shows no `ERROR`, and `systemctl list-timers 'bpm*'` lists both timers.
 - `stat -c '%i %n' /space/*` prints `256` for every adopted project.
 - `ls /space/.bpm/projects/slime_os-private/*/snapshot/target` is empty.
 - Edit a file, wait for a tick (`journalctl -u bpm -f`), and `bpm list <project>` shows a new

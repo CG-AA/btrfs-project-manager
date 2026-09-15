@@ -12,7 +12,7 @@ use anyhow::Result;
 
 pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
     let mut pref = project::resolve(ctx, &a.project)?;
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let snaps = pref.unit.snapshots()?;
     let sel = a.snapshot.clone().unwrap_or_else(|| "latest".into());
     let meta = super::select(ctx, &pref.unit, &snaps, &sel)?.clone();
@@ -20,7 +20,7 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
         if !a.paths.is_empty() {
             return Err(usage("--recreate restores the whole project; do not list paths"));
         }
-        let new_uuid = rollback::recreate(ctx, &mut pref, &meta)?;
+        let new_uuid = rollback::recreate(ctx, &lu, &mut pref, &meta)?;
         if ctx.opts.dry_run {
             return Ok(());
         }
@@ -32,7 +32,7 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
         let post =
             snapshot::take(ctx, &target, &SnapOpts::new(SnapshotKind::Post, format!("recreated from #{}", meta.id)))?;
         observe::init_new_live(ctx, &eff, &mut st, &post, pref.path(), ctx.now())?;
-        pref.unit.write_state(&st)?;
+        lu.write_state(&st)?;
         emit(
             ctx,
             &serde_json::json!({"project": pref.name(), "recreated_from": meta.id, "uuid": new_uuid, "snapshot": post.id}),
@@ -69,8 +69,8 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
         )?;
         observe::note_snapshot(&mut st, &post);
         let mut snaps = pref.unit.snapshots()?;
-        observe::after_command(ctx, &target, &eff, pref.record.adopted, &mut st, &mut snaps)?;
-        pref.unit.write_state(&st)?;
+        observe::after_command(ctx, &lu, &target, &eff, pref.record.adopted, &mut st, &mut snaps)?;
+        lu.write_state(&st)?;
     }
     emit(ctx, &report, || {
         let mut s: Vec<String> = report.restored.iter().map(|p| format!("restored {}", p.display())).collect();
@@ -85,7 +85,7 @@ pub fn restore(ctx: &Ctx, a: RestoreArgs) -> Result<()> {
 pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<()> {
     let mut pref = project::resolve(ctx, &a.project)?;
     let eff = super::effective(ctx, &pref)?;
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let snaps = pref.unit.snapshots()?;
     let meta = super::select(ctx, &pref.unit, &snaps, &a.snapshot)?.clone();
     if newest(&snaps).is_some_and(|n| n.id == meta.id) {
@@ -96,7 +96,7 @@ pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<()> {
             return Err(refused(format!("{} is already identical to snapshot #{}", pref.name(), meta.id)));
         }
     }
-    let report = rollback::rollback(ctx, &mut pref, &eff, &meta, a.drop_build_dirs, a.force)?;
+    let report = rollback::rollback(ctx, &lu, &mut pref, &eff, &meta, a.drop_build_dirs, a.force)?;
     if ctx.opts.dry_run {
         return Ok(());
     }
@@ -137,7 +137,7 @@ pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<()> {
         (None, _) => observe::accept_as_reference(&mut st, &post),
         (Some(_), None) => observe::mark_evaluated(&mut st, &post),
     }
-    pref.unit.write_state(&st)?;
+    lu.write_state(&st)?;
     emit(
         ctx,
         &serde_json::json!({"project": pref.name(), "rolled_back_to": meta.id, "safety_snapshot": report.safety_snapshot, "post_snapshot": post.id, "report": report, "unfroze": unfroze}),

@@ -10,7 +10,7 @@ use crate::hooks::{self, HookCtx, HookEvent};
 use crate::policy::{change, thin};
 use crate::project::ProjectRef;
 use crate::store::journal::Journal;
-use crate::store::{ProjectState, RecompressRecord, SnapshotKind, SnapshotMeta, newest};
+use crate::store::{LockedUnit, ProjectState, RecompressRecord, SnapshotKind, SnapshotMeta, newest};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::io::{Read, Write};
@@ -27,6 +27,7 @@ pub struct CollapseReport {
 /// Ensure the newest snapshot equals live, then delete every policy-deletable older snapshot.
 pub fn collapse(
     ctx: &Ctx,
+    lu: &LockedUnit,
     pref: &ProjectRef,
     eff: &EffectiveConfig,
     st: &mut ProjectState,
@@ -46,7 +47,7 @@ pub fn collapse(
             // the newest snapshot already holds this state: count it if it was taken without stats
             if n.stats.is_none() {
                 let mut n = n;
-                snapshot::count_stats(ctx, &target, &mut n, eff.policy.snapshot.stats_budget)?;
+                snapshot::count_stats(ctx, lu, &target, &mut n, eff.policy.snapshot.stats_budget)?;
                 if let Some(slot) = snaps.iter_mut().find(|m| m.id == n.id) {
                     *slot = n;
                 }
@@ -61,7 +62,7 @@ pub fn collapse(
             snaps.push(m);
         }
     }
-    if observe::evaluate_guard(ctx, &target, eff, st, snaps, now, Walk::Never) {
+    if observe::evaluate_guard(ctx, lu, &target, eff, st, snaps, now, Walk::Never) {
         report.froze = true;
         return Ok(report);
     }
@@ -81,7 +82,7 @@ pub fn collapse(
         let Some(meta) = snaps.iter().find(|m| m.id == id).cloned() else {
             continue;
         };
-        match snapshot::delete(ctx, &pref.unit, &pref.record, snaps, &meta, DeleteMode::Policy, "collapse") {
+        match snapshot::delete(ctx, lu, &pref.record, snaps, &meta, DeleteMode::Policy, "collapse") {
             Ok(()) => {
                 report.deleted.push(id);
                 snaps.retain(|m| m.id != id);
@@ -167,8 +168,10 @@ pub struct RecompressReport {
     pub free_after: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn recompress(
     ctx: &Ctx,
+    lu: &LockedUnit,
     pref: &ProjectRef,
     eff: &EffectiveConfig,
     st: &mut ProjectState,
@@ -194,7 +197,7 @@ pub fn recompress(
         skip(&mut report, "project is frozen".into());
         return Ok(report);
     }
-    let c = collapse(ctx, pref, eff, st, snaps)?;
+    let c = collapse(ctx, lu, pref, eff, st, snaps)?;
     report.deleted.extend(c.deleted);
     if c.froze {
         skip(&mut report, "shrink guard froze the project".into());
@@ -266,7 +269,7 @@ pub fn recompress(
     observe::note_snapshot(st, &m);
     report.new_snapshot = Some(m.id);
     snaps.push(m.clone());
-    if observe::evaluate_guard(ctx, &target, eff, st, snaps, ctx.now(), Walk::Never) {
+    if observe::evaluate_guard(ctx, lu, &target, eff, st, snaps, ctx.now(), Walk::Never) {
         journal.finish()?;
         skip(&mut report, "shrink guard froze the project after defragment".into());
         return Ok(report);
@@ -308,7 +311,7 @@ pub fn recompress(
     if !old.hold && old.kind.class() != crate::store::KindClass::Keep {
         match snapshot::delete(
             ctx,
-            &pref.unit,
+            lu,
             &pref.record,
             snaps,
             &old,

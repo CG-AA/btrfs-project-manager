@@ -92,7 +92,7 @@ pub fn convert(ctx: &Ctx, a: ConvertArgs) -> Result<()> {
     if !eff.is_banned(&rel) {
         tracing::warn!("{rel} is not in the banlist of {}; it will be excluded from snapshots anyway", pref.name());
     }
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     ctx.btrfs.sync(pref.path())?;
     let before = ctx.btrfs.subvol_info(pref.path())?;
     banlist::convert(ctx, pref.path(), &rel, !a.discard_contents, a.force)?;
@@ -102,7 +102,7 @@ pub fn convert(ctx: &Ctx, a: ConvertArgs) -> Result<()> {
     ctx.btrfs.sync(pref.path())?;
     let after = ctx.btrfs.subvol_info(pref.path())?;
     crate::mechanics::observe::note_tool_change(&mut st, &before, &after, ctx.now());
-    pref.unit.write_state(&st)?;
+    lu.write_state(&st)?;
     emit(ctx, &serde_json::json!({"project": pref.name(), "converted": rel}), || {
         format!("{}: {rel} is now a nested subvolume", pref.name())
     });

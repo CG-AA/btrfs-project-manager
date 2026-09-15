@@ -204,3 +204,28 @@ pub fn root_entries(env: &Env, marker: &str) -> Vec<PathBuf> {
         .filter(|p| p.file_name().unwrap().to_string_lossy().contains(marker))
         .collect()
 }
+
+impl Env {
+    /// Switch the root to automatic adoption.
+    pub fn auto_adopt(&self) {
+        let cfgp = self.base.join("config.toml");
+        let c = fs::read_to_string(&cfgp).unwrap().replace("adopt = \"manual\"", "adopt = \"auto\"");
+        fs::write(&cfgp, c).unwrap();
+    }
+
+    /// Which uuid each store unit's record and snapshots belong to, by project label.
+    pub fn units_by_uuid(&self, labels: &[(bpm::btrfs::Uuid, &str)]) -> Vec<(String, String, Vec<String>)> {
+        let label = |u: bpm::btrfs::Uuid| {
+            labels.iter().find(|(x, _)| *x == u).map(|(_, l)| l.to_string()).unwrap_or("?".into())
+        };
+        self.store()
+            .units()
+            .unwrap()
+            .into_iter()
+            .map(|(u, rec)| {
+                let snaps = u.snapshots().unwrap().iter().map(|m| label(m.source_uuid)).collect();
+                (u.name.clone(), label(rec.uuid), snaps)
+            })
+            .collect()
+    }
+}

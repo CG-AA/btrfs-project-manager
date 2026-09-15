@@ -1,18 +1,17 @@
 [Unit]
-Description=bpm: snapshot changed projects, enforce banlists, thin and age snapshots
+Description=bpm: adopt, convert, collapse and recompress projects (one operation per run)
 Documentation=man:bpm(1) https://github.com/
 After=local-fs.target time-sync.target
 ConditionPathExists=@CFG@
 
 [Service]
 Type=oneshot
-ExecStart=@BIN@ --no-sudo --config @CFG@ tick --no-heavy
-SyslogIdentifier=bpm
-Nice=10
-IOSchedulingClass=best-effort
-IOSchedulingPriority=6
+ExecStart=@BIN@ --no-sudo --config @CFG@ tick --heavy-only
+SyslogIdentifier=bpm-heavy
+Nice=15
+IOSchedulingClass=idle
 CPUSchedulingPolicy=batch
-TimeoutStartSec=1h
+TimeoutStartSec=6h
 ProtectSystem=full
 ProtectHome=read-only
 ReadWritePaths=@RW@

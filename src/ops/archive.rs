@@ -18,7 +18,7 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
     if (a.delete_live || a.delete_snapshots) && !a.yes {
         return Err(refused("--delete-live and --delete-snapshots need --yes"));
     }
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let mut st = pref.unit.read_state()?;
     if st.frozen.is_some() {
         return Err(refused(format!("{} is frozen; resolve that first (bpm status {})", pref.name(), pref.name())));
@@ -71,7 +71,7 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
     let banned: Vec<std::path::PathBuf> = eff.banlist_paths();
     if a.delete_live && live_exists {
         if let Err(why) = retire::prove(ctx, pref.path(), &Expect::Snapshot { kept: &meta }, &banned) {
-            pref.unit.write_state(&st)?;
+            lu.write_state(&st)?;
             return Err(refused(format!(
                 "archive written, but {} is not exactly snapshot #{} ({why}); live project and snapshots kept",
                 pref.path().display(),
@@ -85,7 +85,7 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
         for m in snaps.iter().filter(|m| !m.hold && m.id != meta.id) {
             snapshot::delete(
                 ctx,
-                &pref.unit,
+                &lu,
                 &pref.record,
                 &remaining,
                 m,
@@ -106,7 +106,7 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
                 st.set_stage(Stage::Archived, ctx.now());
             }
             Err(why) => {
-                pref.unit.write_state(&st)?;
+                lu.write_state(&st)?;
                 return Err(refused(format!(
                     "archive written, but {} is not exactly snapshot #{} ({why}); live project kept",
                     pref.path().display(),
@@ -115,7 +115,7 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
             }
         }
     }
-    pref.unit.write_state(&st)?;
+    lu.write_state(&st)?;
     hooks::run(ctx, HookEvent::PostArchive, &hctx)?;
     emit(
         ctx,
@@ -160,11 +160,11 @@ pub fn unarchive(ctx: &Ctx, a: UnarchiveArgs) -> Result<()> {
                 ctx.now(),
             );
             record.uuid_history = manifest.uuid_history.clone();
-            unit.write_record(&record)?;
+            unit.lock(ctx.cfg.global.lock_timeout)?.write_record(&record)?;
             ProjectRef { root, store, unit, record }
         }
     };
-    let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+    let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
     let meta = archive::receive(ctx, &pref, &file, &manifest)?;
     let mut st = pref.unit.read_state()?;
     st.banlist_seen.extend(manifest.nested.iter().cloned());
@@ -179,7 +179,7 @@ pub fn unarchive(ctx: &Ctx, a: UnarchiveArgs) -> Result<()> {
                 meta.id
             );
         } else {
-            rollback::recreate(ctx, &mut pref, &meta)?;
+            rollback::recreate(ctx, &lu, &mut pref, &meta)?;
             let eff = super::effective(ctx, &pref)?;
             banlist::enforce_cheap(
                 ctx,
@@ -199,7 +199,7 @@ pub fn unarchive(ctx: &Ctx, a: UnarchiveArgs) -> Result<()> {
             recreated = true;
         }
     }
-    pref.unit.write_state(&st)?;
+    lu.write_state(&st)?;
     emit(
         ctx,
         &serde_json::json!({"project": pref.name(), "received_snapshot": meta.id, "recreated": recreated}),

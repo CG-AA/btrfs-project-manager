@@ -28,12 +28,12 @@ pub fn run(ctx: &Ctx, a: RecompressArgs) -> Result<()> {
     let mut failed = 0;
     for pref in targets {
         let eff = super::effective(ctx, &pref)?;
-        let _l = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
+        let lu = pref.unit.lock(ctx.cfg.global.lock_timeout)?;
         let mut st = pref.unit.read_state()?;
         let mut snaps = pref.unit.snapshots()?;
         let level = a.level.unwrap_or(eff.policy.recompress.level);
-        let r = recompress::recompress(ctx, &pref, &eff, &mut st, &mut snaps, level, a.force);
-        pref.unit.write_state(&st)?;
+        let r = recompress::recompress(ctx, &lu, &pref, &eff, &mut st, &mut snaps, level, a.force);
+        lu.write_state(&st)?;
         match r {
             Ok(r) => reports.push((pref.name().to_string(), r)),
             Err(e) => {

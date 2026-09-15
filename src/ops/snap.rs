@@ -146,16 +146,20 @@ pub fn snap_project(ctx: &Ctx, pref: &ProjectRef, a: &SnapArgs, kind: SnapshotKi
     o.pair = a.pair;
     let meta = snapshot::take(ctx, &target, &o)?;
     // Without the lock the tick owns the state; it counts and checks this snapshot next time.
-    if lock.is_some() {
+    if let Some(lu) = &lock {
         observe::note_snapshot(&mut st, &meta);
         snaps.push(meta.clone());
-        observe::after_command(ctx, &target, &eff, pref.record.adopted, &mut st, &mut snaps)?;
-        pref.unit.write_state(&st)?;
+        observe::after_command(ctx, lu, &target, &eff, pref.record.adopted, &mut st, &mut snaps)?;
+        lu.write_state(&st)?;
     }
     Ok(SnapResult { project: pref.name().into(), id: Some(meta.id), kind: kind.to_string(), skipped: None })
 }
 
-pub fn container_record(ctx: &Ctx, root: &crate::config::RootCfg, unit: &crate::store::Unit) -> Result<ProjectRecord> {
+pub fn container_record(
+    ctx: &Ctx,
+    root: &crate::config::RootCfg,
+    unit: &crate::store::LockedUnit,
+) -> Result<ProjectRecord> {
     if !ctx.btrfs.is_subvolume(&root.path)? {
         bail!("{} is not a subvolume root; container snapshots are not possible", root.path.display());
     }
@@ -177,8 +181,8 @@ fn snap_container(ctx: &Ctx, root: &crate::config::RootCfg, a: &SnapArgs, kind: 
     let store = ctx.store(root);
     let unit = store.container();
     unit.ensure_dir()?;
-    let _lock = unit.lock(super::lock_timeout(ctx, a.lock_timeout))?;
-    let rec = container_record(ctx, root, &unit)?;
+    let lu = unit.lock(super::lock_timeout(ctx, a.lock_timeout))?;
+    let rec = container_record(ctx, root, &lu)?;
     let snaps = unit.snapshots()?;
     if a.if_changed && {
         ctx.btrfs.sync(&root.path)?;
