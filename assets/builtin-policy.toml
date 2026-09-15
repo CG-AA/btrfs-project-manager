@@ -1,0 +1,41 @@
+# Compiled-in per-project policy defaults. Every key must exist here; config layers override.
+banlist_precreate = "primary"   # primary | all | none
+banlist_settle = "2m"
+keep_build_on_adopt = true
+
+[snapshot]
+min_interval = "5m"
+stats = true
+stats_budget = "120s"
+stats_min_interval = "30m"
+
+[thin]
+keep_all = "6h"
+hourly = "48h"
+daily = "14d"
+weekly = "8w"
+safety_ttl = "7d"
+min_free = "20G"
+
+[lifecycle]
+dormant_after = "14d"
+cold_after = "60d"
+adopt_grace = "24h"
+
+[recompress]
+enabled = true
+level = 9
+max_bytes = "50G"
+min_free = "30G"
+min_expected_gain = 0.05
+nested = false
+
+[shrink_guard]
+enabled = true
+ratio = 0.30
+min_files = 100
+min_bytes = "50M"
+catastrophic = 0.10
+exclude = [".git"]
+sentinels = [".git"]
+thin_after_freeze = true

@@ -1,0 +1,20 @@
+# Built-in project profiles. A [profiles.<name>] table in /etc/bpm/config.toml replaces one of these.
+[rust]
+markers = ["Cargo.toml"]
+banlist = ["target"]
+
+[cmake]
+markers = ["CMakeLists.txt"]
+banlist = ["build", "cmake-build-debug", "cmake-build-release", "out"]
+
+[node]
+markers = ["package.json"]
+banlist = ["node_modules", "dist", ".next", ".turbo"]
+
+[python]
+markers = ["pyproject.toml", "requirements.txt", "setup.py"]
+banlist = [".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache"]
+
+[generic]
+markers = []
+banlist = []

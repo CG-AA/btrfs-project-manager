@@ -1,0 +1,13 @@
+[Unit]
+Description=Run bpm tick every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+RandomizedDelaySec=20s
+Persistent=true
+Unit=bpm.service
+
+[Install]
+WantedBy=timers.target

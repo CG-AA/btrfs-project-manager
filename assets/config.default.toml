@@ -1,0 +1,64 @@
+# bpm configuration. Installed by `bpm setup` as /etc/bpm/config.toml.
+# Show the merged result for a project with: bpm config <project> --show-origin
+version = 1
+
+[global]
+store_dir = ".bpm"                # store subvolume, relative to each root
+lock_timeout = "30s"              # manual commands wait this long for a lock; tick never waits
+sudo = true                       # re-exec through `sudo -n` when a command needs root
+hooks_dir = "/etc/bpm/hooks.d"
+hook_timeout = "60s"
+project_hooks = "off"             # off | allowlist | on   (hooks inside repos are agent-writable)
+project_hooks_allow = []
+project_config = true             # honour <project>/.bpm.toml
+archive_dir = "/archives/bpm"
+archive_zstd_level = 19
+heavy_min_free = "10G"            # no adopt/convert/collapse/recompress below this
+profile_order = ["generic", "python", "node", "cmake", "rust"]
+hook_throttle = "2m"              # `snap --claude-hook` for non-destructive commands
+destructive_patterns = [
+  '\brm\s+(-[a-zA-Z]*[rRf]|--recursive|--force)',
+  '\bgit\s+clean\b',
+  '\bgit\s+reset\s+--hard',
+  '\bgit\s+(checkout|restore)\s+(\.|--)',
+  '\bgit\s+stash\s+(drop|clear)',
+  '\bfind\b.*\s-delete\b',
+  '\brsync\b.*--delete',
+  '\b(cargo|make|ninja)\s+clean\b',
+  '\bmv\s',
+  '\btruncate\s',
+  '>\s*[^&|]',
+]
+
+[[root]]
+path = "/space"
+ignore = ["datasets", "lost+found"]
+adopt = "auto"                    # auto: tick adopts new top-level dirs | manual: only `bpm adopt`
+adopt_min_age = "15m"             # newest mtime in a new dir must be older than this
+banlist_add = []
+
+[root.container]                  # snapshots of the root's own loose files and ignored dirs
+enabled = true
+interval = "6h"
+keep_all = "24h"
+daily = "7d"
+weekly = "4w"
+
+[defaults]
+profile = "auto"
+banlist = [".cache"]
+
+# Uncomment to change a policy value for every project (see `bpm config <project>` for all keys):
+# [defaults.snapshot]
+# min_interval = "5m"
+# [defaults.lifecycle]
+# dormant_after = "14d"
+# cold_after = "60d"
+# [defaults.recompress]
+# level = 9
+
+[projects."slime_os-private"]
+banlist_add = ["build"]
+
+[projects."tts"]
+banlist_add = ["models"]

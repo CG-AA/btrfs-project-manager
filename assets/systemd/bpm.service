@@ -1,0 +1,25 @@
+[Unit]
+Description=bpm: snapshot changed projects, enforce banlists, thin and age snapshots
+Documentation=man:bpm(1) https://github.com/
+After=local-fs.target
+ConditionPathExists=/etc/bpm/config.toml
+
+[Service]
+Type=oneshot
+ExecStart=@BIN@ --no-sudo tick
+SyslogIdentifier=bpm
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+TimeoutStartSec=6h
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=@RW@
+PrivateTmp=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+LockPersonality=yes
