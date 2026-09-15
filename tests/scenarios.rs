@@ -204,6 +204,32 @@ fn build_dirs_recreated_and_converted() {
     assert!(env.state("demo").pending_convert.is_empty());
 }
 
+/// make treats an existing `build` directory as an up-to-date non-phony `build` target, so bpm
+/// never creates one in a Makefile project, but still converts the one the build makes.
+#[test]
+fn make_build_dir_converted_but_never_created() {
+    let env = Env::new("");
+    make_project(&env, "demo", 20);
+    fs::remove_file(env.p("demo/Cargo.toml")).unwrap();
+    fs::write(env.p("demo/Makefile"), "build:\n\tmkdir -p build && touch build/out\n").unwrap();
+    env.run(&["adopt", "demo"]).unwrap();
+    assert!(!env.p("demo/build").exists(), "not created at adopt");
+
+    write_files(&env.p("demo/build"), 3, "o");
+    for _ in 0..3 {
+        env.advance(600);
+        env.run(&["tick"]).unwrap();
+    }
+    assert!(env.fake.is_subvolume(&env.p("demo/build")).unwrap(), "converted by a heavy tick op");
+    assert!(env.p("demo/build/o0.txt").exists());
+
+    // `make clean`
+    fs::remove_dir_all(env.p("demo/build")).unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    assert!(!env.p("demo/build").exists(), "not recreated after make clean");
+}
+
 #[test]
 fn rename_relinks_store_and_auto_adopt() {
     let env = Env::new("");
