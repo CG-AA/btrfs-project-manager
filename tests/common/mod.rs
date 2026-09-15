@@ -119,6 +119,14 @@ min_bytes = "1K"
     pub fn p(&self, rel: &str) -> PathBuf {
         self.root.join(rel)
     }
+    /// Every `bpm doctor` finding as one string, for asserting that a problem is reported.
+    pub fn doctor(&self) -> String {
+        bpm::ops::doctor::findings(&self.ctx(), false)
+            .iter()
+            .map(|f| format!("{}: {}", f.level, f.what))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 pub fn write_files(dir: &Path, n: usize, prefix: &str) {

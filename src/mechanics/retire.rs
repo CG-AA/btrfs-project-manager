@@ -24,10 +24,35 @@ pub enum Expect<'a> {
     /// A directory (or file): nothing in it changed after `not_after`, and, when given, its
     /// counts equal those of the copy that was kept. `exclude` are relative paths skipped by both.
     Tree { stats: Option<walk::TreeStats>, not_after: Timestamp, exclude: Vec<PathBuf> },
+    /// A non-directory bpm has just moved aside. Its ctime cannot be read back after the move
+    /// (the rename bumps it), so `pre` are the facts read just before, and the file on disk must
+    /// still be the one they describe.
+    Replaced { pre: FileFacts, not_after: Timestamp },
     /// A subvolume: identical (by transaction counters) to the snapshot `kept` of it.
     Snapshot { kept: &'a SnapshotMeta },
     /// Content already verified: only check that nothing uses it and nothing unsaved is inside.
     Verified,
+}
+
+/// Identity and timestamps of a non-directory, read before bpm moves it aside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileFacts {
+    ino: u64,
+    size: u64,
+    mtime_ns: i128,
+    change_ns: i128,
+}
+
+impl FileFacts {
+    pub fn of(md: &std::fs::Metadata) -> Self {
+        let ns = |s: i64, n: i64| s as i128 * 1_000_000_000 + n as i128;
+        FileFacts {
+            ino: md.ino(),
+            size: md.size(),
+            mtime_ns: ns(md.mtime(), md.mtime_nsec()),
+            change_ns: ns(md.mtime(), md.mtime_nsec()).max(ns(md.ctime(), md.ctime_nsec())),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -100,6 +125,19 @@ pub fn prove(ctx: &Ctx, path: &Path, expect: &Expect, allowed_nested: &[PathBuf]
     let subvolume = md.is_dir() && ctx.btrfs.is_subvolume(path).unwrap_or(false);
     match expect {
         Expect::Verified => {}
+        Expect::Replaced { pre, not_after } => {
+            if md.is_dir() {
+                return Err(Unproven("is a directory, but a file was moved aside".into()));
+            }
+            if Timestamp::from_nanosecond(pre.change_ns).is_ok_and(|c| c > *not_after) {
+                return Err(Unproven(format!("modified after {not_after}")));
+            }
+            // the move must not have raced a writer: same inode, same size, same mtime
+            let now = FileFacts::of(&md);
+            if (now.ino, now.size, now.mtime_ns) != (pre.ino, pre.size, pre.mtime_ns) {
+                return Err(Unproven("changed while it was being replaced".into()));
+            }
+        }
         Expect::Snapshot { kept } => {
             ctx.btrfs.sync(path).map_err(|e| Unproven(format!("sync: {e:#}")))?;
             let live: SubvolInfo = ctx.btrfs.subvol_info(path).map_err(|e| Unproven(format!("{e:#}")))?;

@@ -129,11 +129,17 @@ pub fn restore_paths(
             }
             return Err(e);
         }
-        if existing.is_some() {
+        if let Some(dmd) = &existing {
+            // The exchange below bumps the replaced inode's ctime, so a file is judged on the
+            // facts read before the move; a directory's own ctime is not part of its tree stats.
+            let expect = if dmd.is_dir() {
+                Expect::Tree { stats: None, not_after: started, exclude: vec![] }
+            } else {
+                Expect::Replaced { pre: retire::FileFacts::of(dmd), not_after: started }
+            };
             ctx.fs.rename_exchange(&dst, &tmp)?;
             // `tmp` now holds what was replaced; it is deleted only if the pre-restore snapshot
             // has all of it (no nested subvolumes or mounts, nothing written since)
-            let expect = Expect::Tree { stats: None, not_after: started, exclude: vec![] };
             let in_project = dst.starts_with(&live);
             match if in_project {
                 retire::retire(ctx, &tmp, &expect, &[], "restore")?

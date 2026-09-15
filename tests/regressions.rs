@@ -837,3 +837,93 @@ fn print_claude_hook_needs_no_root() {
     let cli = <bpm::cli::Cli as clap::Parser>::try_parse_from(["bpm", "setup", "--print-claude-hook"]).unwrap();
     assert!(!cli.cmd.needs_root());
 }
+
+// ---------------- restore proves the file it replaces ----------------
+
+/// `restore --overwrite` of a single file: the exchange that moves the old copy aside bumps its
+/// ctime, which must not be mistaken for a user write. The old copy is unchanged since the
+/// pre-restore snapshot, so it is deleted rather than kept as `.bpm-keep-restore-*`.
+#[test]
+fn restore_overwrite_file_leaves_no_keep() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::write(env.p("demo/src/note.txt"), "snapshot content").unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    let id = env.snaps("demo").last().unwrap().id.to_string();
+    fs::write(env.p("demo/src/note.txt"), "live content").unwrap();
+    env.advance(600);
+    env.run(&["restore", "demo", &id, "src/note.txt", "--overwrite"]).unwrap();
+    assert_eq!(fs::read_to_string(env.p("demo/src/note.txt")).unwrap(), "snapshot content");
+    let keeps: Vec<_> = walkdir::WalkDir::new(env.p("demo"))
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".bpm-keep-"))
+        .map(|e| e.path().display().to_string())
+        .collect();
+    assert!(keeps.is_empty(), "the replaced copy was kept: {keeps:?}");
+    assert!(!env.p("demo/src/note.txt.bpm-tmp").exists());
+}
+
+/// The same restore with `--to`: proving fails outside the project with a hard error, so the
+/// ctime bump used to turn a successful restore into a failure that left a `.bpm-tmp` behind.
+#[test]
+fn restore_file_to_directory_succeeds() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::write(env.p("demo/src/note.txt"), "snapshot content").unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    let id = env.snaps("demo").last().unwrap().id.to_string();
+    let out = env.root.join("out");
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("note.txt"), "stale copy").unwrap();
+    env.advance(600);
+    env.run(&["restore", "demo", &id, "src/note.txt", "--to", out.to_str().unwrap(), "--overwrite"]).unwrap();
+    assert_eq!(fs::read_to_string(out.join("note.txt")).unwrap(), "snapshot content");
+    assert!(!out.join("note.txt.bpm-tmp").exists(), "the temporary copy was left behind");
+}
+
+/// A write to the live file after the pre-restore snapshot is still unsaved work: the replaced
+/// copy must be kept, and `bpm doctor` must report it wherever in the tree it sits.
+#[test]
+fn restore_overwrite_keeps_modified_file_and_doctor_reports_it() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::write(env.p("demo/src/note.txt"), "snapshot content").unwrap();
+    env.advance(600);
+    env.run(&["tick"]).unwrap();
+    let id = env.snaps("demo").last().unwrap().id.to_string();
+    env.advance(600);
+    let unit = env.unit("demo").lock(Duration::ZERO).unwrap();
+    let before = env.snaps("demo").last().unwrap().id;
+    drop(unit);
+    // written after the pre-restore snapshot is taken, via a hook that fires between the two
+    install_hook(
+        &env,
+        "post-snapshot",
+        "dirty",
+        "#!/bin/sh\nprintf 'unsaved work' > \"$BPM_PROJECT_PATH/src/note.txt\"\n",
+    );
+    env.run(&["restore", "demo", &id, "src/note.txt", "--overwrite"]).unwrap();
+    assert!(env.snaps("demo").last().unwrap().id > before);
+    let keeps: Vec<_> = walkdir::WalkDir::new(env.p("demo"))
+        .into_iter()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().contains(".bpm-keep-"))
+        .map(|e| e.path().to_path_buf())
+        .collect();
+    assert_eq!(keeps.len(), 1, "the modified copy must be kept: {keeps:?}");
+    assert_eq!(fs::read_to_string(&keeps[0]).unwrap(), "unsaved work");
+    let report = env.doctor();
+    assert!(
+        report.contains(&keeps[0].display().to_string()),
+        "doctor must report the kept file anywhere in the tree:\n{report}"
+    );
+}

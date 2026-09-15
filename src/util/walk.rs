@@ -130,6 +130,39 @@ pub fn tree_stats(
     Ok(st)
 }
 
+/// Paths under `root` whose file name contains `marker`, skipping nested subvolumes and
+/// `exclude`. The second element is false when `budget` ran out before the walk finished.
+pub fn find_marker(
+    root: &Path,
+    probe: SubvolProbe,
+    exclude: &[PathBuf],
+    marker: &str,
+    budget: Duration,
+) -> (Vec<PathBuf>, bool) {
+    let start = Instant::now();
+    let mut found = Vec::new();
+    let mut complete = true;
+    let mut n: u64 = 0;
+    let walker = WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
+        if e.depth() == 0 {
+            return true;
+        }
+        let r = rel(root, e.path());
+        !(exclude.iter().any(|x| x == r) || nested(e, probe))
+    });
+    for entry in walker.flatten() {
+        if entry.depth() > 0 && entry.file_name().to_string_lossy().contains(marker) {
+            found.push(entry.path().to_path_buf());
+        }
+        n += 1;
+        if n % 4096 == 0 && start.elapsed() > budget {
+            complete = false;
+            break;
+        }
+    }
+    (found, complete)
+}
+
 pub fn nanos(sec: i64, nsec: i64) -> i128 {
     sec as i128 * 1_000_000_000 + nsec as i128
 }

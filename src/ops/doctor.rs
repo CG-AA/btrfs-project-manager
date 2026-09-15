@@ -11,7 +11,7 @@ use crate::store::{SnapshotKind, SnapshotMeta, Stage, Unit};
 use crate::util::relpath::RelPath;
 use anyhow::Result;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Serialize, Clone, Debug)]
@@ -99,7 +99,34 @@ fn snapper_configs_for(root: &Path) -> Vec<(String, bool)> {
 }
 
 pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
-    let mut d = Doc { ctx, fix: a.fix, out: vec![] };
+    let out = findings(ctx, a.fix);
+    let problems = out.iter().filter(|f| matches!(f.level, "warn" | "error") && !f.fixed).count();
+    emit(ctx, &out, || {
+        let mut t = Table::new(&["", "FINDING", "FIX"]);
+        for f in &out {
+            let mark = match (f.level, f.fixed) {
+                (_, true) => "fixed",
+                ("ok", _) => "ok",
+                ("info", _) => "info",
+                ("warn", _) => "WARN",
+                _ => "ERROR",
+            };
+            t.row(vec![mark.into(), f.what.clone(), f.fix.clone().unwrap_or_default()]);
+        }
+        let mut s = t.render();
+        if problems > 0 && !a.fix && out.iter().any(|f| f.fix.as_deref().is_some_and(|x| x.starts_with("doctor --fix")))
+        {
+            s += "\nrun `bpm doctor --fix` to repair the items marked `doctor --fix`\n";
+        }
+        s
+    });
+    Ok(())
+}
+
+/// Run every check, applying repairs when `fix`. Separate from rendering so that tests and
+/// callers that only want the results do not have to parse the table.
+pub fn findings(ctx: &Ctx, fix: bool) -> Vec<Finding> {
+    let mut d = Doc { ctx, fix, out: vec![] };
     match &ctx.cfg_path {
         Some(p) => d.ok(format!("config {}", p.display())),
         None => d.warn("no config file; using the embedded default", Some("bpm setup".into())),
@@ -244,6 +271,7 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
             }
             if let Ok(eff) = project::effective(ctx, &root, &f.name, &f.path) {
                 check_nested_leftovers(&mut d, &f.path, &eff.banlist);
+                check_kept_leftovers(&mut d, &f.path, &eff.banlist_paths());
                 for rel in st.pending_convert.keys() {
                     d.info(format!(
                         "{}: banned directory {rel} is a plain directory (included in snapshots until converted)",
@@ -255,29 +283,7 @@ pub fn run(ctx: &Ctx, a: DoctorArgs) -> Result<()> {
     }
     check_claude_hook(&mut d);
     check_snap_sudo(&mut d);
-    let problems = d.out.iter().filter(|f| matches!(f.level, "warn" | "error") && !f.fixed).count();
-    emit(ctx, &d.out, || {
-        let mut t = Table::new(&["", "FINDING", "FIX"]);
-        for f in &d.out {
-            let mark = match (f.level, f.fixed) {
-                (_, true) => "fixed",
-                ("ok", _) => "ok",
-                ("info", _) => "info",
-                ("warn", _) => "WARN",
-                _ => "ERROR",
-            };
-            t.row(vec![mark.into(), f.what.clone(), f.fix.clone().unwrap_or_default()]);
-        }
-        let mut s = t.render();
-        if problems > 0
-            && !a.fix
-            && d.out.iter().any(|f| f.fix.as_deref().is_some_and(|x| x.starts_with("doctor --fix")))
-        {
-            s += "\nrun `bpm doctor --fix` to repair the items marked `doctor --fix`\n";
-        }
-        s
-    });
-    Ok(())
+    d.out
 }
 
 /// The original tree left by an adopt interrupted after the swap: delete it only if it matches
@@ -445,17 +451,28 @@ fn check_nested_leftovers(d: &mut Doc, live: &Path, banlist: &[RelPath]) {
                 );
             }
         }
-        if let (Some(parent), Some(fname)) = (full.parent(), full.file_name()) {
-            let prefix = format!("{}{}", fname.to_string_lossy(), retire::KEEP_MARKER);
-            for e in std::fs::read_dir(parent).into_iter().flatten().flatten() {
-                if e.file_name().to_string_lossy().starts_with(&prefix) {
-                    d.error(
-                        format!("{}: kept because it may hold changes that exist nowhere else", e.path().display()),
-                        Some("inspect, merge by hand, then delete it".into()),
-                    );
-                }
-            }
-        }
+    }
+}
+
+/// Trees and files `retire` kept anywhere in the project because it could not prove they were
+/// already saved. They may hold the only copy of something, so doctor only reports them.
+fn check_kept_leftovers(d: &mut Doc, live: &Path, exclude: &[PathBuf]) {
+    let ctx = d.ctx;
+    let (found, complete) = crate::util::walk::find_marker(
+        live,
+        &|p, i| ctx.is_subvol(p, i),
+        exclude,
+        retire::KEEP_MARKER,
+        std::time::Duration::from_secs(30),
+    );
+    for p in found {
+        d.error(
+            format!("{}: kept because it may hold changes that exist nowhere else", p.display()),
+            Some("inspect, merge by hand, then delete it".into()),
+        );
+    }
+    if !complete {
+        d.info(format!("{}: took too long to scan for kept leftovers; some may be unreported", live.display()));
     }
 }
 
