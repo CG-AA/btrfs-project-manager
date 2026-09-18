@@ -135,7 +135,7 @@ pub fn adopt(ctx: &Ctx, root: &RootCfg, name: &str, o: &AdoptOpts) -> Result<Ado
         let cwd_users: Vec<_> = users.into_iter().filter(|u| u.cwd).collect();
         if !cwd_users.is_empty() {
             tracing::warn!(
-                "processes with a working directory inside {name} will keep the old directory until they `cd` again: {}",
+                "processes with a working directory inside {name} are left in the old directory, which is deleted if unchanged; `cd` back in: {}",
                 proc::describe(&cwd_users)
             );
         }

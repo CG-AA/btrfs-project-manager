@@ -97,12 +97,32 @@ fn mounts_under(path: &Path) -> Vec<String> {
 }
 
 /// Check `path` against `expect`. `allowed_nested` are relative paths of nested subvolumes that
-/// may be deleted with it (build directories the user chose to drop).
+/// may be deleted with it (build directories the user chose to drop). Any process using the tree,
+/// even only as its working directory, refuses: for a live tree (archive).
 pub fn prove(ctx: &Ctx, path: &Path, expect: &Expect, allowed_nested: &[PathBuf]) -> Result<Proof, Unproven> {
+    prove_with(ctx, path, expect, allowed_nested, false)
+}
+
+/// `prove` for a tree bpm has already swapped out of place. Processes whose working directory
+/// is inside do not refuse it: they were warned they hold the old tree, `expect` shows they
+/// wrote nothing there, and once it is deleted their writes fail instead of landing in a copy
+/// nobody looks at. Open files still refuse.
+pub fn prove_aside(ctx: &Ctx, path: &Path, expect: &Expect, allowed_nested: &[PathBuf]) -> Result<Proof, Unproven> {
+    prove_with(ctx, path, expect, allowed_nested, true)
+}
+
+fn prove_with(
+    ctx: &Ctx,
+    path: &Path,
+    expect: &Expect,
+    allowed_nested: &[PathBuf],
+    allow_cwd: bool,
+) -> Result<Proof, Unproven> {
     let md = std::fs::symlink_metadata(path).map_err(|e| Unproven(format!("stat: {e}")))?;
-    let users = proc::open_under(path);
+    let users: Vec<_> = proc::open_under(path).into_iter().filter(|u| !(allow_cwd && u.cwd)).collect();
     if !users.is_empty() {
-        return Err(Unproven(format!("in use by {}", proc::describe(&users))));
+        // relative paths: `path` is usually renamed right after this, so absolute ones would mislead
+        return Err(Unproven(format!("in use by {}", proc::describe_under(&users, path))));
     }
     if let Some(m) = mounts_under(path).first() {
         return Err(Unproven(format!("{m} is mounted inside")));
@@ -212,9 +232,10 @@ pub fn keep_name(ctx: &Ctx, path: &Path, op: &str) -> PathBuf {
     candidate
 }
 
-/// Delete `path` if it matches `expect`, otherwise keep it under a leftover name.
+/// Delete `path`, a tree bpm has swapped out, if it matches `expect`; otherwise keep it under a
+/// leftover name.
 pub fn retire(ctx: &Ctx, path: &Path, expect: &Expect, allowed_nested: &[PathBuf], op: &str) -> Result<Outcome> {
-    match prove(ctx, path, expect, allowed_nested) {
+    match prove_aside(ctx, path, expect, allowed_nested) {
         Ok(proof) => {
             delete(ctx, proof)?;
             Ok(Outcome::Deleted)
