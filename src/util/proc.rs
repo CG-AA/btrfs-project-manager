@@ -66,3 +66,24 @@ pub fn writers_under(dir: &Path) -> Vec<OpenUse> {
 pub fn describe(uses: &[OpenUse]) -> String {
     uses.iter().take(5).map(|u| format!("{}[{}] {}", u.comm, u.pid, u.path.display())).collect::<Vec<_>>().join(", ")
 }
+
+/// `describe` with paths relative to `dir` (`.` for `dir` itself), for a tree about to be renamed.
+pub fn describe_under(uses: &[OpenUse], dir: &Path) -> String {
+    let dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    uses.iter()
+        .take(5)
+        .map(|u| {
+            let rel = u.path.strip_prefix(&dir).map(|r| r.to_path_buf()).unwrap_or_else(|_| u.path.clone());
+            let rel = if rel.as_os_str().is_empty() { PathBuf::from(".") } else { rel };
+            let what = if u.cwd {
+                "working directory"
+            } else if u.writing {
+                "open for writing"
+            } else {
+                "open"
+            };
+            format!("{}[{}] {} ({what})", u.comm, u.pid, rel.display())
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
