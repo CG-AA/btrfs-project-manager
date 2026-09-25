@@ -7,7 +7,7 @@ use crate::mechanics::retire::{self, Expect};
 use crate::output::{Table, emit};
 use crate::project::{self, Leftover};
 use crate::store::journal::Journal;
-use crate::store::{SnapshotKind, SnapshotMeta, Stage, Unit};
+use crate::store::{SnapshotKind, SnapshotMeta, Stage, Store, Unit, lock};
 use crate::util::relpath::RelPath;
 use anyhow::Result;
 use serde::Serialize;
@@ -254,6 +254,7 @@ pub fn findings(ctx: &Ctx, fix: bool) -> Vec<Finding> {
         for unit in units {
             check_unit(&mut d, &unit);
         }
+        check_orphan_units(&mut d, &store);
         for f in &disc.managed {
             let st = f.unit.read_state().unwrap_or_default();
             if let Some(fr) = &st.frozen {
@@ -536,6 +537,67 @@ fn check_unit(d: &mut Doc, unit: &Unit) {
             || super::tick::cleanup_unit(ctx, &u),
         );
     }
+}
+
+/// Store directories without `project.toml`: left by a `forget` that stopped halfway, or by a
+/// tick that wrote state for a project forgotten while it waited. Nothing else lists them.
+fn check_orphan_units(d: &mut Doc, store: &Store) {
+    let ctx = d.ctx;
+    let Ok(rd) = std::fs::read_dir(store.projects_dir()) else { return };
+    let mut dirs: Vec<_> = rd.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect();
+    dirs.sort();
+    for dir in dirs {
+        let unit = store.unit(&dir.file_name().unwrap_or_default().to_string_lossy());
+        // an adoption in progress holds the lock before it writes the record
+        if unit.record_path().exists() || lock::is_held(&unit.dir.join("lock")) {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&unit.dir) else { continue };
+        let mut other: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !is_orphan_debris(n))
+            .collect();
+        other.sort();
+        if other.is_empty() {
+            let u = unit.clone();
+            d.fixable(
+                "warn",
+                format!(
+                    "{}: store directory has no project.toml (left over from a forgotten project)",
+                    unit.dir.display()
+                ),
+                "doctor --fix removes it".into(),
+                move || remove_orphan_unit(ctx, &u),
+            );
+        } else {
+            d.warn(
+                format!("{}: store directory has no project.toml but holds {}", unit.dir.display(), other.join(", ")),
+                Some("inspect it; snapshots in it are not managed".into()),
+            );
+        }
+    }
+}
+
+/// State a unit keeps besides its record: safe to delete once the record is gone.
+fn is_orphan_debris(name: &str) -> bool {
+    matches!(name, "state.toml" | "FROZEN" | "lock") || crate::util::fs::is_atomic_tmp(name)
+}
+
+fn remove_orphan_unit(ctx: &Ctx, unit: &Unit) -> Result<()> {
+    let lu = unit.lock(std::time::Duration::ZERO)?;
+    if lu.record_path().exists() {
+        anyhow::bail!("{} got a project.toml meanwhile", lu.dir.display());
+    }
+    for e in std::fs::read_dir(&lu.dir)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name != "lock" && is_orphan_debris(&name) {
+            ctx.fs.remove_file(&e.path())?;
+        }
+    }
+    // as in `forget`: the lock goes last, immediately followed by its directory
+    ctx.fs.remove_file(&lu.dir.join("lock"))?;
+    ctx.fs.remove_dir(&lu.dir)
 }
 
 fn recover_meta(ctx: &Ctx, unit: &Unit, id: u64, path: &Path) -> Result<()> {

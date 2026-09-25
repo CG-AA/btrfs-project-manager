@@ -1005,3 +1005,55 @@ fn project_file_cannot_switch_management_off() {
     assert!(env.state("demo").frozen.is_some(), "the wipe froze the project: {}", describe(&env, "demo"));
     assert!(env.doctor().contains("managed = false"), "doctor reports the ignored key:\n{}", env.doctor());
 }
+
+// ---------------- forget leaves nothing behind ----------------
+
+/// Temp files of atomic writes that failed (ENOSPC) kept `forget` from removing the unit
+/// directory after it had already deleted the snapshots and the record.
+#[test]
+fn forget_removes_stale_atomic_write_temp_files() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::write(env.unit("demo").dir.join(".state.toml.tmp.1768361"), "").unwrap();
+    fs::remove_dir_all(env.p("demo")).unwrap();
+    env.run(&["forget", "demo", "--delete-snapshots", "--yes"]).unwrap();
+    assert!(!env.unit("demo").dir.exists(), "unit left behind: {:?}", fs::read_dir(env.unit("demo").dir).ok());
+}
+
+/// A file bpm did not write stops `forget` before any snapshot is deleted, not after.
+#[test]
+fn forget_refuses_unknown_files_before_deleting_snapshots() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.run(&["adopt", "demo"]).unwrap();
+    fs::write(env.unit("demo").dir.join("notes.txt"), "mine").unwrap();
+    let err = env.run(&["forget", "demo", "--delete-snapshots", "--yes"]).unwrap_err();
+    assert_eq!(bpm::error::exit_code_for(&err), 7, "{err:#}");
+    assert!(format!("{err:#}").contains("notes.txt"), "{err:#}");
+    assert_eq!(env.snaps("demo").len(), 1);
+    assert!(env.unit("demo").read_record().unwrap().is_some());
+}
+
+/// A store directory without `project.toml` is listed nowhere else; doctor reports it and
+/// `--fix` removes it when it only holds bpm's own state.
+#[test]
+fn doctor_reports_and_removes_orphaned_unit_directories() {
+    let env = Env::new("");
+    let orphan = env.unit("gone");
+    fs::create_dir_all(&orphan.dir).unwrap();
+    fs::write(orphan.dir.join("state.toml"), "").unwrap();
+    fs::write(orphan.dir.join("FROZEN"), "live project directory disappeared").unwrap();
+    fs::write(orphan.dir.join(".state.toml.tmp.2010439"), "").unwrap();
+    let kept = env.unit("kept");
+    fs::create_dir_all(kept.dir.join("3")).unwrap();
+    fs::write(kept.dir.join("state.toml"), "").unwrap();
+
+    let report = env.doctor();
+    assert!(report.contains("gone: store directory has no project.toml"), "{report}");
+    assert!(report.contains("kept: store directory has no project.toml but holds 3"), "{report}");
+
+    bpm::ops::doctor::findings(&env.ctx(), true);
+    assert!(!orphan.dir.exists());
+    assert!(kept.dir.join("3").exists(), "a directory that may hold snapshots is only reported");
+}

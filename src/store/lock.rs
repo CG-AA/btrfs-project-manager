@@ -42,6 +42,12 @@ impl Lock {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        // the holder we waited for may have removed or moved the lock file with its directory
+        // (`forget`, a relink): this lock then guards nothing, and writing through it would
+        // recreate a directory that was just deleted
+        if !same_file(&file, path) {
+            return Err(BpmError::Locked { holder: format!("{what}: removed or moved while waiting") }.into());
+        }
         let desc = format!(
             "pid={} since={} cmd={}",
             std::process::id(),
@@ -52,6 +58,24 @@ impl Lock {
         let _ = file.seek(SeekFrom::Start(0));
         let _ = file.write_all(desc.as_bytes());
         Ok(Lock { file, path: path.to_path_buf() })
+    }
+}
+
+/// Does some process hold the lock at `path`? Needs only read access, so `doctor` can ask as a
+/// normal user; a missing or unreadable lock file counts as not held.
+pub fn is_held(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).custom_flags(libc::O_CLOEXEC).open(path) else {
+        return false;
+    };
+    let r = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+}
+
+fn same_file(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), std::fs::metadata(path)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
     }
 }
 
@@ -75,5 +99,20 @@ mod tests {
         assert!(format!("{err}").contains("pid="));
         drop(a);
         Lock::acquire(&p, Duration::ZERO, "t").unwrap();
+    }
+    #[test]
+    fn removed_while_waiting() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("lock");
+        let a = Lock::acquire(&p, Duration::ZERO, "t").unwrap();
+        let p2 = p.clone();
+        let waiter = std::thread::spawn(move || Lock::acquire(&p2, Duration::from_secs(5), "t"));
+        std::thread::sleep(Duration::from_millis(250));
+        std::fs::remove_file(&p).unwrap();
+        drop(a);
+        let err = waiter.join().unwrap().err().unwrap();
+        assert_eq!(crate::error::exit_code_for(&err), 4);
+        assert!(format!("{err}").contains("removed or moved"));
+        assert!(!p.exists());
     }
 }

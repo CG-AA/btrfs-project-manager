@@ -67,6 +67,26 @@ pub fn run(ctx: &Ctx, a: RmArgs) -> Result<()> {
     Ok(())
 }
 
+/// Files bpm writes into a unit directory besides snapshots and `lock`.
+const OWN_FILES: [&str; 4] = ["project.toml", "state.toml", "FROZEN", "op.journal"];
+
+/// Entries of a unit directory that are neither bpm's own files nor snapshot directories.
+fn unknown_entries(dir: &std::path::Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let ours = OWN_FILES.contains(&name.as_str())
+            || name == "lock"
+            || crate::util::fs::is_atomic_tmp(&name)
+            || name.trim_end_matches(".tmp").parse::<u64>().is_ok();
+        if !ours {
+            out.push(name);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 pub fn forget(ctx: &Ctx, a: ForgetArgs) -> Result<()> {
     let pref = project::resolve(ctx, &a.project)?;
     // lock first: a tick waiting to snapshot must not add a snapshot this command does not see
@@ -79,7 +99,20 @@ pub fn forget(ctx: &Ctx, a: ForgetArgs) -> Result<()> {
             pref.path().display()
         );
     }
-    let snaps = lu.snapshots()?;
+    // refuse before deleting any snapshot, not after: a forget that stops halfway leaves a unit
+    // without its record that nothing lists any more
+    let scan = lu.scan()?;
+    let mut blockers = unknown_entries(&pref.unit.dir)?;
+    blockers.extend(scan.tmp_dirs.iter().map(|p| format!("{} (in-progress snapshot)", p.display())));
+    blockers.extend(scan.without_meta.iter().map(|(id, _)| format!("#{id} (snapshot without metadata)")));
+    if !blockers.is_empty() {
+        return Err(refused(format!(
+            "{} holds more than bpm's own files and snapshots: {}; inspect with `bpm doctor`",
+            pref.unit.dir.display(),
+            blockers.join(", ")
+        )));
+    }
+    let snaps = scan.snapshots;
     if !snaps.is_empty() && !a.delete_snapshots {
         return Err(refused(format!(
             "{} has {} snapshots; pass --delete-snapshots --yes to delete them",
@@ -102,14 +135,16 @@ pub fn forget(ctx: &Ctx, a: ForgetArgs) -> Result<()> {
             pref.unit.dir.display()
         )));
     }
-    // only bpm's own files: never recurse into a snapshot subvolume
-    for f in ["project.toml", "state.toml", "FROZEN", "op.journal"] {
-        if pref.unit.dir.join(f).exists() {
-            let _ = ctx.fs.remove_file(&pref.unit.dir.join(f));
-        }
+    // metadata of snapshots that are already gone, as the tick's cleanup removes it
+    for id in scan.without_snapshot {
+        ctx.fs.remove_dir_all(&lu.snapshot_dir(id))?;
     }
+    // only bpm's own files: never recurse into a snapshot subvolume
     for e in std::fs::read_dir(&pref.unit.dir)?.flatten() {
-        if e.file_type().is_ok_and(|t| t.is_dir()) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if OWN_FILES.contains(&name.as_str()) || crate::util::fs::is_atomic_tmp(&name) {
+            let _ = ctx.fs.remove_file(&e.path());
+        } else if e.file_type().is_ok_and(|t| t.is_dir()) {
             let _ = ctx.fs.remove_dir(&e.path());
         }
     }
