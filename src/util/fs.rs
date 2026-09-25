@@ -74,10 +74,11 @@ pub enum ReflinkMode {
 }
 
 /// Write `bytes` to `path` via a temp file in the same directory, fsync, rename, fsync dir.
+/// A failed write (ENOSPC) removes its temp file, so it cannot keep a store directory non-empty.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let dir = path.parent().context("atomic write target has no parent")?;
     let tmp = dir.join(format!(".{}.tmp.{}", path.file_name().unwrap().to_string_lossy(), std::process::id()));
-    {
+    let written = (|| -> Result<()> {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -85,15 +86,28 @@ pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
             .mode(mode)
             .open(&tmp)
             .with_context(|| format!("create {}", tmp.display()))?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+        f.write_all(bytes).with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all().with_context(|| format!("fsync {}", tmp.display()))?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+        fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
-    fs::rename(&tmp, path).with_context(|| format!("rename into {}", path.display()))?;
+    written?;
     if let Ok(d) = fs::File::open(dir) {
         let _ = d.sync_all();
     }
     Ok(())
+}
+
+/// Is `name` a `write_atomic` temp file (`.<target>.tmp.<pid>`), for example one left by a
+/// process that was killed mid-write?
+pub fn is_atomic_tmp(name: &str) -> bool {
+    name.starts_with('.')
+        && name
+            .rsplit_once(".tmp.")
+            .is_some_and(|(stem, pid)| stem.len() > 1 && !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn cstr(p: &Path) -> Result<CString> {
@@ -214,6 +228,13 @@ mod tests {
         write_atomic(&f, b"a=2", 0o644).unwrap();
         assert_eq!(fs::read_to_string(&f).unwrap(), "a=2");
         assert_eq!(fs::read_dir(d.path()).unwrap().count(), 1);
+        // a failing write leaves no temp file behind: the target is a directory, so rename fails
+        let blocker = d.path().join("dir.toml");
+        fs::create_dir(&blocker).unwrap();
+        fs::write(blocker.join("inside"), "").unwrap();
+        assert!(write_atomic(&blocker, b"a=3", 0o644).is_err());
+        assert_eq!(fs::read_dir(d.path()).unwrap().count(), 2);
+        fs::remove_dir_all(&blocker).unwrap();
         let a = d.path().join("a");
         let b = d.path().join("b");
         fs::create_dir(&a).unwrap();
@@ -221,6 +242,16 @@ mod tests {
         fs::create_dir(&b).unwrap();
         rename_exchange(&a, &b).unwrap();
         assert!(b.join("in_a").exists());
+    }
+    #[test]
+    fn atomic_tmp_names() {
+        assert!(is_atomic_tmp(".state.toml.tmp.2010439"));
+        assert!(is_atomic_tmp(".FROZEN.tmp.1"));
+        assert!(!is_atomic_tmp("state.toml"));
+        assert!(!is_atomic_tmp("9.tmp"));
+        assert!(!is_atomic_tmp(".tmp.12"));
+        assert!(!is_atomic_tmp(".state.toml.tmp."));
+        assert!(!is_atomic_tmp(".state.toml.tmp.12x"));
     }
     #[test]
     fn relative_paths() {
