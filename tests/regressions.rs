@@ -288,6 +288,40 @@ fn adopt_keeps_original_written_after_swap() {
     assert_eq!(fs::read_to_string(kept[0].join("src/late.txt")).unwrap(), "late\n");
 }
 
+/// A shell whose working directory is inside the project (it was warned) does not keep an
+/// unchanged original around.
+#[test]
+fn adopt_deletes_unchanged_original_used_only_as_cwd() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    let mut shell = std::process::Command::new("sleep").arg("30").current_dir(env.p("demo/src")).spawn().unwrap();
+    let r = env.run(&["adopt", "demo"]);
+    let _ = shell.kill();
+    let _ = shell.wait();
+    r.unwrap();
+    assert!(root_entries(&env, ".bpm-").is_empty(), "{:?}", root_entries(&env, ".bpm-"));
+}
+
+/// An open file still keeps the original.
+#[test]
+fn adopt_keeps_original_with_open_file() {
+    let env = Env::new("");
+    make_rust_project(&env, "demo");
+    env.advance(10);
+    let mut holder = std::process::Command::new("sh")
+        .args(["-c", "exec 3<Cargo.toml; sleep 30"])
+        .current_dir(env.p("demo"))
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let r = env.run(&["adopt", "demo"]);
+    let _ = holder.kill();
+    let _ = holder.wait();
+    r.unwrap();
+    assert_eq!(root_entries(&env, ".bpm-keep-adopt-").len(), 1, "{:?}", root_entries(&env, ".bpm-"));
+}
+
 /// Hardlinks between top-level entries are split by the per-entry copy; adoption still verifies.
 #[test]
 fn adopt_with_hardlinks_across_entries() {

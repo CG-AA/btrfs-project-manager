@@ -146,7 +146,7 @@ pub fn restore_paths(
             } else {
                 retire::delete(
                     ctx,
-                    retire::prove(ctx, &tmp, &expect, &[]).map_err(|e| {
+                    retire::prove_aside(ctx, &tmp, &expect, &[]).map_err(|e| {
                         refused(format!(
                             "{} was replaced but could not be removed ({e}); it is at {}",
                             dst.display(),
@@ -301,7 +301,7 @@ pub fn rollback(
     lu.write_record(&pref.record)?;
     journal.step(6)?;
     // checked before nested subvolumes are moved out (which changes the aside's counters)
-    let unchanged = retire::prove(ctx, &aside, &Expect::Snapshot { kept: &safety }, &nested).map(|_| ());
+    let unchanged = retire::prove_aside(ctx, &aside, &Expect::Snapshot { kept: &safety }, &nested).map(|_| ());
     let mut moved = Vec::new();
     let mut dropped = Vec::new();
     for rel in &nested {
@@ -343,7 +343,7 @@ pub fn rollback(
     // nested subvolumes left behind are build dirs the user chose to drop, or it is kept.
     let leftover = match unchanged {
         Err(why) => keep_aside(ctx, &aside, &why.to_string())?,
-        Ok(()) => match retire::prove(ctx, &aside, &Expect::Verified, &dropped) {
+        Ok(()) => match retire::prove_aside(ctx, &aside, &Expect::Verified, &dropped) {
             Ok(proof) => match retire::delete(ctx, proof) {
                 Ok(()) => None,
                 Err(e) => {
