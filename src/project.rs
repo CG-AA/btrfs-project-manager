@@ -144,18 +144,21 @@ impl ProjectRef {
     }
 }
 
-/// Root and top-level directory name containing `path`, if any.
+/// Root and top-level directory name containing `path`, if any. With nested roots (`/space` and
+/// `/space/work`) the most specific root that contains `path` decides.
 pub fn locate_path(ctx: &Ctx, path: &Path) -> Option<(RootCfg, String)> {
     let abs = std::fs::canonicalize(path).ok().or_else(|| {
         // the directory may have been deleted: fall back to a lexical absolute path
         std::path::absolute(path).ok()
     })?;
-    ctx.roots().into_iter().find_map(|root| {
-        let rel = abs.strip_prefix(&root.path).ok()?;
-        let first = rel.components().next()?;
-        let name = first.as_os_str().to_string_lossy().into_owned();
-        (!name.starts_with('.')).then_some((root, name))
-    })
+    let root = ctx
+        .roots()
+        .into_iter()
+        .filter(|root| abs.starts_with(&root.path))
+        .max_by_key(|root| root.path.components().count())?;
+    let first = abs.strip_prefix(&root.path).ok()?.components().next()?;
+    let name = first.as_os_str().to_string_lossy().into_owned();
+    (!name.starts_with('.')).then_some((root, name))
 }
 
 pub fn resolve(ctx: &Ctx, spec: &str) -> Result<ProjectRef> {

@@ -1091,3 +1091,34 @@ fn doctor_reports_and_removes_orphaned_unit_directories() {
     assert!(!orphan.dir.exists());
     assert!(kept.dir.join("3").exists(), "a directory that may hold snapshots is only reported");
 }
+
+// ---------------- nested roots ----------------
+
+/// With roots `/space` and `/space/work`, a path under `/space/work` belongs to the inner root, so
+/// the agent hook and path arguments snapshot the right project instead of skipping it.
+#[test]
+fn nested_root_wins_over_the_root_containing_it() {
+    let env = Env::new("");
+    let work = env.p("work");
+    fs::create_dir(&work).unwrap();
+    env.fake.register_existing(&work).unwrap();
+    let cfg_path = env.base.join("config.toml");
+    let mut cfg = fs::read_to_string(&cfg_path).unwrap();
+    cfg.push_str(&format!("\n[[root]]\npath = \"{}\"\nadopt = \"manual\"\nadopt_min_age = \"0s\"\n", work.display()));
+    fs::write(&cfg_path, cfg).unwrap();
+    env.run(&["setup", "--no-units"]).unwrap();
+    make_rust_project(&env, "work/app");
+    let work_s = work.display().to_string();
+    env.run(&["--root", &work_s, "adopt", "app"]).unwrap();
+
+    let ctx = env.ctx();
+    let found = bpm::ops::snap::projects_in_command(&ctx, &work.join("app/src"), "ls");
+    assert_eq!(
+        found.iter().map(|(r, n)| (r.path.clone(), n.as_str())).collect::<Vec<_>>(),
+        vec![(work.clone(), "app")]
+    );
+
+    fs::write(work.join("app/src/new.txt"), "n").unwrap();
+    env.run(&["snap", &work.join("app").display().to_string()]).unwrap();
+    assert_eq!(Store::new(&work, ".bpm", false).unit("app").snapshots().unwrap().len(), 2);
+}
