@@ -8,7 +8,8 @@ AI agents, without paying for build output in every snapshot.
   subvolumes**, which btrfs snapshots skip. `cargo clean` and `rm -rf build` keep working; bpm
   recreates the directory afterwards.
 - A systemd timer runs `bpm tick` every 5 minutes. A project is snapshotted only when its content
-  actually changed, detected exactly from btrfs transaction counters. Slow work (adoption,
+  actually changed, detected exactly from btrfs transaction counters (a `btrfs balance` is not a
+  change). Slow work (adoption,
   recompression) runs from a second timer, so it never delays snapshots.
 - A **shrink guard** checks every snapshot, including the quick ones taken by the agent hook, and
   notices when a project suddenly loses files, bytes, or a sentinel such as `.git`. It pins the
@@ -77,8 +78,14 @@ A snapshot inherits its source subvolume's `ctransid` (last content change), and
 does not bump it. bpm stores the snapshot's `ctransid` and creation transaction. Each tick flushes
 the filesystem and compares them with the live subvolume. Equal `ctransid` and a generation no newer
 than the snapshot means nothing changed, including deletions and renames. Writes inside nested
-build subvolumes do not count. These rules were verified on this machine's kernel; see
-`src/policy/change.rs`.
+build subvolumes do not count.
+
+The generation also moves when nothing changed: `btrfs balance` and metadata defragmentation
+rewrite tree blocks without touching any file. When only the generation moved, bpm asks the
+kernel (a read-only tree search, root only) whether any inode is newer than the snapshot, and
+remembers a clean answer for that snapshot, so a balance costs one search per project. Without
+root the question cannot be asked and the move counts as a change, as it always did. These rules
+were verified on this machine's kernel; see `src/policy/change.rs`.
 
 ## Lifecycle
 

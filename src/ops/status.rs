@@ -2,7 +2,9 @@
 
 use crate::cli::StatusArgs;
 use crate::ctx::Ctx;
+use crate::mechanics::observe;
 use crate::output::{Table, emit};
+use crate::policy::change::Change;
 use crate::project::{self, Discovery};
 use crate::store::{Stage, newest};
 use crate::util::bytes::fmt_bytes;
@@ -192,6 +194,8 @@ struct Detail {
     snapshots_by_kind: BTreeMap<String, usize>,
     live_ctransid: Option<u64>,
     changed_since_newest: Option<bool>,
+    /// How live differs from the newest snapshot (`unverified` without root after a balance).
+    change: Option<Change>,
 }
 
 fn detail(ctx: &Ctx, spec: &str) -> Result<()> {
@@ -228,6 +232,11 @@ fn detail(ctx: &Ctx, spec: &str) -> Result<()> {
     for m in &snaps {
         *by_kind.entry(m.kind.to_string()).or_insert(0) += 1;
     }
+    // reads the remembered balance check; status never writes state
+    let change = live.as_ref().map(|l| {
+        let mut scratch = st.clone();
+        observe::changed(ctx, pref.path(), l, newest(&snaps), Some(&mut scratch))
+    });
     let d = Detail {
         name: pref.name().into(),
         path: pref.path().into(),
@@ -241,7 +250,8 @@ fn detail(ctx: &Ctx, spec: &str) -> Result<()> {
         unprotected_nested: unprotected,
         snapshots_by_kind: by_kind,
         live_ctransid: live.as_ref().map(|l| l.ctransid),
-        changed_since_newest: live.as_ref().map(|l| crate::policy::change::changed_since(l, newest(&snaps))),
+        changed_since_newest: change.map(|c| !c.identical()),
+        change,
     };
     emit(ctx, &d, || {
         let now = ctx.now();
@@ -259,9 +269,13 @@ fn detail(ctx: &Ctx, spec: &str) -> Result<()> {
         );
         s += &format!(
             "  live       {}\n",
-            match (&live, d.changed_since_newest) {
+            match (&live, d.change) {
                 (None, _) => "MISSING".to_string(),
-                (Some(_), Some(true)) => "changed since newest snapshot".into(),
+                (Some(_), Some(Change::Content)) => "changed since newest snapshot".into(),
+                (Some(_), Some(Change::Inode)) => "changed since newest snapshot (inode metadata)".into(),
+                (Some(_), Some(Change::Unverified)) => {
+                    "tree rewritten since newest snapshot (balance?); content check needs root".into()
+                }
                 (Some(_), _) => "identical to newest snapshot".into(),
             }
         );

@@ -164,6 +164,13 @@ pub fn hook_snap(env: &Env, name: &str, destructive: bool) {
     env.run(&a).unwrap();
 }
 
+/// How many privileged inode searches (the balance check) ran on project `name`.
+pub fn searches(env: &Env, name: &str) -> usize {
+    let path = fs::canonicalize(env.p(name)).unwrap();
+    let prefix = format!("search {} >", path.display());
+    env.fake.ops().iter().filter(|o| o.starts_with(&prefix)).count()
+}
+
 /// Does snapshot `id` of `name` contain `rel`?
 pub fn snap_has(env: &Env, name: &str, id: u64, rel: &str) -> bool {
     env.unit(name).snapshot_path(id).join(rel).symlink_metadata().is_ok()

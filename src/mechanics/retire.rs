@@ -7,7 +7,7 @@
 
 use crate::btrfs::SubvolInfo;
 use crate::ctx::Ctx;
-use crate::policy::change;
+use crate::policy::change::Change;
 use crate::store::SnapshotMeta;
 use crate::util::{proc, walk};
 use anyhow::Result;
@@ -164,8 +164,18 @@ fn prove_with(
             if live.uuid != kept.source_uuid {
                 return Err(Unproven(format!("is subvolume {}, not the source of snapshot #{}", live.uuid, kept.id)));
             }
-            if !change::identical(&live, kept) {
-                return Err(Unproven(format!("changed after snapshot #{} was taken", kept.id)));
+            // stateless: nothing remembered, every proof asks again
+            match super::observe::changed(ctx, path, &live, Some(kept), None) {
+                Change::None => {}
+                Change::Unverified => {
+                    return Err(Unproven(format!(
+                        "metadata rewritten after snapshot #{} and the content check could not run",
+                        kept.id
+                    )));
+                }
+                Change::Content | Change::Inode => {
+                    return Err(Unproven(format!("changed after snapshot #{} was taken", kept.id)));
+                }
             }
         }
         Expect::Tree { stats, not_after, exclude } => {

@@ -7,7 +7,6 @@ use crate::mechanics::Target;
 use crate::mechanics::observe;
 use crate::mechanics::snapshot::{self, SnapOpts};
 use crate::output::emit;
-use crate::policy::change;
 use crate::project::{self, ProjectRef};
 use crate::store::{CONTAINER, ProjectRecord, SnapshotKind, newest};
 use crate::util::time::age;
@@ -131,12 +130,21 @@ pub fn snap_project(ctx: &Ctx, pref: &ProjectRef, a: &SnapArgs, kind: SnapshotKi
             return skip("throttled");
         }
     }
-    if a.if_changed && {
+    if a.if_changed {
         // buffered writes only reach the subvolume counters at writeback
         ctx.btrfs.sync(pref.path())?;
-        !change::changed_since(&ctx.btrfs.subvol_info(pref.path())?, newest(&snaps))
-    } {
-        return skip("unchanged");
+        let now_live = ctx.btrfs.subvol_info(pref.path())?;
+        let before = st.clone();
+        // without the lock the tick owns the state: check, but remember nothing
+        let c = observe::changed(ctx, pref.path(), &now_live, newest(&snaps), lock.is_some().then_some(&mut st));
+        if c.identical() {
+            if let Some(lu) = &lock
+                && st != before
+            {
+                lu.write_state(&st)?;
+            }
+            return skip("unchanged");
+        }
     }
     let target = Target::for_project(pref, &eff);
     let mut o = SnapOpts::new(kind, default_reason(a, kind));
@@ -186,7 +194,8 @@ fn snap_container(ctx: &Ctx, root: &crate::config::RootCfg, a: &SnapArgs, kind: 
     let snaps = unit.snapshots()?;
     if a.if_changed && {
         ctx.btrfs.sync(&root.path)?;
-        !change::changed_since(&ctx.btrfs.subvol_info(&root.path)?, newest(&snaps))
+        observe::changed_persisted(ctx, &lu, &root.path, &ctx.btrfs.subvol_info(&root.path)?, newest(&snaps))?
+            .identical()
     } {
         return Ok(SnapResult {
             project: CONTAINER.into(),

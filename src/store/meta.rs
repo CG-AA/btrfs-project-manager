@@ -113,6 +113,16 @@ pub struct ArchiveRecord {
     pub snapshot: u64,
 }
 
+/// Live `generation` proven to differ from snapshot `snapshot` only by tree-block rewrites
+/// (balance, metadata defragment): no inode item was newer than that snapshot. Keyed by the
+/// snapshot because the reference can move to an older one (`bpm rm` of the newest) while the
+/// live generation does not move back.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CleanMark {
+    pub snapshot: u64,
+    pub generation: u64,
+}
+
 /// Mutable per-project state. The derived fields (activity, stage, snapshot bookkeeping, guard
 /// progress) are written only through `mechanics::observe`; operations report what they did
 /// there instead of updating fields themselves.
@@ -134,6 +144,8 @@ pub struct ProjectState {
     /// Collapse found live identical to the newest snapshot but could not count it within the
     /// stats budget at this `ctransid`; do not retry until the project changes.
     pub collapse_incomplete_ctransid: Option<u64>,
+    /// Written only by `mechanics::observe::changed`.
+    pub clean: Option<CleanMark>,
     pub last_snapshot_at: Option<Timestamp>,
     pub last_stats_at: Option<Timestamp>,
     pub ref_stats: Option<RefStats>,

@@ -107,7 +107,7 @@ pub fn rollback(ctx: &Ctx, a: RollbackArgs) -> Result<()> {
         // in-place writes reach the counters only when flushed
         ctx.btrfs.sync(pref.path())?;
         let live = ctx.btrfs.subvol_info(pref.path())?;
-        if crate::policy::change::identical(&live, &meta) {
+        if observe::changed(ctx, pref.path(), &live, Some(&meta), None).identical() {
             return Err(refused(format!("{} is already identical to snapshot #{}", pref.name(), meta.id)));
         }
     }

@@ -1,22 +1,60 @@
 //! Change detection from subvolume transaction counters.
 //!
 //! A snapshot inherits the source's `ctransid` and snapshotting does not bump it, so equal
-//! `ctransid` means no content change since that snapshot. `generation` is compared with the
-//! snapshot's creation transaction as a second signal, because some metadata-only changes
-//! (a bare chmod) move `generation` without moving `ctransid`.
+//! `ctransid` means no content change since that snapshot (a bare chmod moves it too, verified
+//! on kernel 7.0). `generation` moving past the snapshot's creation transaction is a second
+//! signal, for inode updates that skip `ctransid` (log replay after a crash). But changes that
+//! touch no inode move it as well: a balance or metadata defragment rewrites tree blocks, and
+//! only `generation` follows. `delta` reports that case as `TreeOnly`; `mechanics::observe::changed`
+//! settles it by asking the kernel whether any inode item is newer than the snapshot.
 
 use crate::btrfs::SubvolInfo;
 use crate::store::{ProjectState, SnapshotMeta};
 use crate::util::time::age;
 use jiff::Timestamp;
+use serde::Serialize;
 use std::time::Duration;
 
-pub fn identical(live: &SubvolInfo, newest: &SnapshotMeta) -> bool {
-    live.ctransid == newest.source_ctransid && live.generation <= newest.snapshot_otransid
+/// What the transaction counters alone say about live versus a snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Delta {
+    /// Same `ctransid`, and no tree block written since the snapshot was created.
+    Unchanged,
+    /// `ctransid` moved: an inode was updated.
+    Content,
+    /// Only `generation` moved: tree blocks were rewritten. Content may or may not differ.
+    TreeOnly,
 }
 
-pub fn changed_since(live: &SubvolInfo, newest: Option<&SnapshotMeta>) -> bool {
-    newest.is_none_or(|n| !identical(live, n))
+pub fn delta(live: &SubvolInfo, snap: &SnapshotMeta) -> Delta {
+    if live.ctransid != snap.source_ctransid {
+        Delta::Content
+    } else if live.generation > snap.snapshot_otransid {
+        Delta::TreeOnly
+    } else {
+        Delta::Unchanged
+    }
+}
+
+/// The settled answer to "does live differ from this snapshot?".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Change {
+    /// Identical: counters unchanged, or only tree blocks were rewritten (balance).
+    None,
+    /// `ctransid` moved.
+    Content,
+    /// Only `generation` moved, and an inode item is newer than the snapshot.
+    Inode,
+    /// Only `generation` moved and the inode check could not run (needs root). Treated as a
+    /// change, and never as proof of identity.
+    Unverified,
+}
+
+impl Change {
+    pub fn identical(self) -> bool {
+        self == Change::None
+    }
 }
 
 /// A content change since the last observation not caused by bpm itself: resets the idle clock.
@@ -36,6 +74,8 @@ pub enum SnapDecision {
 pub struct SnapInputs<'a> {
     pub live: &'a SubvolInfo,
     pub newest: Option<&'a SnapshotMeta>,
+    /// `live` against `newest`, settled by `mechanics::observe::changed`.
+    pub change: Change,
     pub now: Timestamp,
     pub min_interval: Duration,
     pub free: u64,
@@ -43,7 +83,7 @@ pub struct SnapInputs<'a> {
 }
 
 pub fn decide_auto_snapshot(i: &SnapInputs) -> SnapDecision {
-    if !changed_since(i.live, i.newest) {
+    if i.change.identical() {
         return SnapDecision::Skip("unchanged");
     }
     if let Some(n) = i.newest {
@@ -54,8 +94,19 @@ pub fn decide_auto_snapshot(i: &SnapInputs) -> SnapDecision {
     if i.free < i.min_free {
         return SnapDecision::Skip("low free space");
     }
-    let from = i.newest.map(|n| n.source_ctransid.to_string()).unwrap_or_else(|| "none".into());
-    SnapDecision::Take(format!("changed (ctransid {from} -> {})", i.live.ctransid))
+    let reason = match (i.change, i.newest) {
+        (Change::Inode, Some(n)) => {
+            format!("changed (inode newer than snapshot #{}; generation {})", n.id, i.live.generation)
+        }
+        (Change::Unverified, Some(n)) => {
+            format!("metadata rewritten since snapshot #{}; content check unavailable", n.id)
+        }
+        _ => {
+            let from = i.newest.map(|n| n.source_ctransid.to_string()).unwrap_or_else(|| "none".into());
+            format!("changed (ctransid {from} -> {})", i.live.ctransid)
+        }
+    };
+    SnapDecision::Take(reason)
 }
 
 #[cfg(test)]
@@ -89,12 +140,16 @@ mod tests {
     }
 
     #[test]
-    fn identity_rules() {
+    fn delta_rules() {
         let s = snap(50, 60, "2026-09-14T10:00:00Z");
-        assert!(identical(&live(50, 60), &s), "right after snapshot: gen == otransid");
-        assert!(!identical(&live(61, 61), &s), "content change");
-        assert!(!identical(&live(50, 61), &s), "metadata-only change seen via generation");
-        assert!(changed_since(&live(1, 1), None));
+        assert_eq!(delta(&live(50, 60), &s), Delta::Unchanged, "right after snapshot: gen == otransid");
+        assert_eq!(delta(&live(50, 59), &s), Delta::Unchanged);
+        assert_eq!(delta(&live(61, 61), &s), Delta::Content, "content change");
+        assert_eq!(delta(&live(50, 61), &s), Delta::TreeOnly, "balance, or an inode update that skipped ctransid");
+        assert!(Change::None.identical());
+        for c in [Change::Content, Change::Inode, Change::Unverified] {
+            assert!(!c.identical(), "{c:?}");
+        }
     }
 
     #[test]
@@ -123,6 +178,7 @@ mod tests {
         let mut i = SnapInputs {
             live: &live(70, 70),
             newest: Some(&s),
+            change: Change::Content,
             now,
             min_interval: Duration::from_secs(300),
             free: 100 << 30,
@@ -130,11 +186,26 @@ mod tests {
         };
         assert_eq!(decide_auto_snapshot(&i), SnapDecision::Skip("min_interval"));
         i.now = "2026-09-14T10:05:00Z".parse().unwrap();
-        assert!(matches!(decide_auto_snapshot(&i), SnapDecision::Take(_)));
+        assert_eq!(decide_auto_snapshot(&i), SnapDecision::Take("changed (ctransid 50 -> 70)".into()));
         i.free = 1 << 30;
         assert_eq!(decide_auto_snapshot(&i), SnapDecision::Skip("low free space"));
-        let l = live(50, 60);
+        i.free = 100 << 30;
+        let l = live(50, 61);
         i.live = &l;
-        assert_eq!(decide_auto_snapshot(&i), SnapDecision::Skip("unchanged"));
+        i.change = Change::None;
+        assert_eq!(decide_auto_snapshot(&i), SnapDecision::Skip("unchanged"), "balance only");
+        i.change = Change::Inode;
+        assert_eq!(
+            decide_auto_snapshot(&i),
+            SnapDecision::Take("changed (inode newer than snapshot #1; generation 61)".into())
+        );
+        i.change = Change::Unverified;
+        assert_eq!(
+            decide_auto_snapshot(&i),
+            SnapDecision::Take("metadata rewritten since snapshot #1; content check unavailable".into())
+        );
+        i.newest = None;
+        i.change = Change::Content;
+        assert_eq!(decide_auto_snapshot(&i), SnapDecision::Take("changed (ctransid none -> 50)".into()));
     }
 }

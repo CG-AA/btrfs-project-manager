@@ -7,7 +7,7 @@ use crate::btrfs::DefragOpts;
 use crate::config::EffectiveConfig;
 use crate::ctx::Ctx;
 use crate::hooks::{self, HookCtx, HookEvent};
-use crate::policy::{change, thin};
+use crate::policy::thin;
 use crate::project::ProjectRef;
 use crate::store::journal::Journal;
 use crate::store::{LockedUnit, ProjectState, RecompressRecord, SnapshotKind, SnapshotMeta, newest};
@@ -44,8 +44,10 @@ pub fn collapse(
     ctx.btrfs.sync(pref.path())?;
     let live = ctx.btrfs.subvol_info(pref.path())?;
     observe::note_live(st, &live, now);
+    let same =
+        newest(snaps).is_some_and(|n| observe::changed(ctx, pref.path(), &live, Some(n), Some(&mut *st)).identical());
     match newest(snaps).cloned() {
-        Some(n) if change::identical(&live, &n) => {
+        Some(n) if same => {
             // the newest snapshot already holds this state: count it if it was taken without stats
             if n.stats.is_none() {
                 let mut n = n;

@@ -341,5 +341,11 @@ mod tests {
         st.frozen = None;
         unit.write_state(&st).unwrap();
         assert!(!unit.frozen_marker().exists());
+
+        // the balance cache: absent in older state files, round-trips when set
+        assert_eq!(unit.read_state().unwrap().clean, None);
+        st.clean = Some(CleanMark { snapshot: 7, generation: 546756 });
+        unit.write_state(&st).unwrap();
+        assert_eq!(unit.read_state().unwrap().clean, Some(CleanMark { snapshot: 7, generation: 546756 }));
     }
 }
