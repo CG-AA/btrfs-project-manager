@@ -133,6 +133,14 @@ pub trait Btrfs: Send + Sync {
     /// Commit the filesystem transaction so counters reflect everything written so far.
     fn sync(&self, path: &Path) -> Result<()>;
 
+    // ---- privileged reads ----
+    /// Does any inode item in the subvolume tree containing `subvol` record a transaction above
+    /// `transid`? Every content or metadata change updates some inode item; a balance or
+    /// metadata defragment does not. `Ok(None)` when the question cannot be asked (the tree
+    /// search needs CAP_SYS_ADMIN). Callers `sync` first: inode updates reach the tree when
+    /// flushed.
+    fn inode_changed_after(&self, subvol: &Path, transid: u64) -> Result<Option<bool>>;
+
     // ---- privileged mutations ----
     fn create_subvolume(&self, path: &Path) -> Result<()>;
     fn snapshot(&self, src: &Path, dst: &Path, readonly: bool) -> Result<()>;
@@ -174,6 +182,9 @@ impl Btrfs for DryRunBtrfs {
     }
     fn sync(&self, path: &Path) -> Result<()> {
         self.0.sync(path)
+    }
+    fn inode_changed_after(&self, subvol: &Path, transid: u64) -> Result<Option<bool>> {
+        self.0.inode_changed_after(subvol, transid)
     }
     fn create_subvolume(&self, path: &Path) -> Result<()> {
         dry!("btrfs subvolume create {}", path.display())

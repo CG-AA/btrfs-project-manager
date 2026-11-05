@@ -3,7 +3,9 @@
 //! Subvolumes are tracked by (dev, inode) of their root directory, so renames keep working.
 //! Counters follow the kernel rules verified on real btrfs: content changes bump `ctransid`
 //! and `generation`; snapshotting bumps only the source `generation`; snapshots inherit
-//! `ctransid`; nested subvolumes appear as empty placeholder directories in snapshots.
+//! `ctransid`; nested subvolumes appear as empty placeholder directories in snapshots. A
+//! balance (`FakeBtrfs::balance`) bumps every subvolume's `generation` and nothing else; the
+//! inode search (`inode_changed_after`) sees only inode updates, tracked as `inode_transid`.
 //!
 //! Like the kernel for buffered writes, counters move only when changes are flushed: on `sync`,
 //! on `snapshot` (for the source) and on `defragment`. Reading counters without a flush sees
@@ -30,6 +32,8 @@ struct FakeSubvol {
     generation: u64,
     ctransid: u64,
     otransid: u64,
+    /// Newest transid recorded in any inode item of the tree (what TREE_SEARCH would find).
+    inode_transid: u64,
     ro: bool,
     fingerprint: u64,
     ctime: Timestamp,
@@ -43,6 +47,8 @@ struct FakeState {
     subvols: HashMap<(u64, u64), FakeSubvol>,
     ops: Vec<String>,
     usage: FsUsage,
+    /// Whether the privileged tree search is allowed (the caller "has CAP_SYS_ADMIN").
+    privileged: bool,
 }
 
 pub struct FakeBtrfs {
@@ -71,6 +77,7 @@ impl FakeBtrfs {
                 subvols: HashMap::new(),
                 ops: Vec::new(),
                 usage: FsUsage { total: 400 << 30, free: 100 << 30 },
+                privileged: true,
             }),
         }
     }
@@ -103,6 +110,36 @@ impl FakeBtrfs {
         self.st.lock().unwrap().ops.clear();
     }
 
+    /// A `btrfs balance`: every tree's blocks are rewritten, read-only snapshots included, so
+    /// `generation` moves everywhere while `ctransid` and every inode item stay as they were.
+    pub fn balance(&self) {
+        let mut st = self.st.lock().unwrap();
+        st.transid += 1;
+        let t = st.transid;
+        for sv in st.subvols.values_mut() {
+            sv.generation = t;
+        }
+        st.ops.push("balance".into());
+    }
+
+    /// An inode update that leaves `ctransid` alone (log replay after a crash): `generation`
+    /// and the inode item move, the content fingerprint does not.
+    pub fn touch_inode_only(&self, path: &Path) -> Result<()> {
+        let mut st = self.st.lock().unwrap();
+        let (_, key) = Self::root_of(&st, path)?;
+        st.transid += 1;
+        let t = st.transid;
+        let sv = st.subvols.get_mut(&key).unwrap();
+        sv.generation = t;
+        sv.inode_transid = t;
+        Ok(())
+    }
+
+    /// Without privilege `inode_changed_after` answers `None`, like the kernel's EPERM.
+    pub fn set_privileged(&self, privileged: bool) {
+        self.st.lock().unwrap().privileged = privileged;
+    }
+
     fn register(
         now: Timestamp,
         st: &mut FakeState,
@@ -125,6 +162,7 @@ impl FakeBtrfs {
             generation: st.transid,
             ctransid: parent.map(|p| p.ctransid).unwrap_or(st.transid),
             otransid: st.transid,
+            inode_transid: parent.map(|p| p.inode_transid).unwrap_or(st.transid),
             ro,
             fingerprint: fp,
             ctime: parent.map(|p| p.ctime).unwrap_or(now),
@@ -166,6 +204,7 @@ impl FakeBtrfs {
         sv.fingerprint = fp;
         sv.generation = t;
         sv.ctransid = t;
+        sv.inode_transid = t;
         sv.ctime = now;
     }
 
@@ -330,6 +369,18 @@ impl Btrfs for FakeBtrfs {
         Ok(())
     }
 
+    fn inode_changed_after(&self, subvol: &Path, transid: u64) -> Result<Option<bool>> {
+        let mut st = self.st.lock().unwrap();
+        if !st.privileged {
+            return Ok(None);
+        }
+        let (root, key) = Self::root_of(&st, subvol)?;
+        let sv = &st.subvols[&key];
+        let newer = sv.inode_transid.max(sv.ctransid) > transid;
+        st.ops.push(format!("search {} >{transid}", root.display()));
+        Ok(Some(newer))
+    }
+
     fn create_subvolume(&self, path: &Path) -> Result<()> {
         if path.exists() {
             bail!("fake: create {}: File exists", path.display());
@@ -405,6 +456,7 @@ impl Btrfs for FakeBtrfs {
         let sv = st.subvols.get_mut(&key).unwrap();
         sv.ctransid = t;
         sv.generation = t;
+        sv.inode_transid = t;
         st.ops.push(format!("defrag -c{} {:?} {}", opts.compress, opts.level, path.display()));
         Ok(())
     }
@@ -516,6 +568,42 @@ mod tests {
         assert!(fb.delete_subvolume(&moved, false).is_err(), "nested subvolume blocks delete");
         fb.delete_subvolume(&moved, true).unwrap();
         assert!(!moved.exists());
+    }
+
+    #[test]
+    fn balance_moves_generation_only() {
+        let d = tempfile::tempdir().unwrap();
+        let fb = FakeBtrfs::new();
+        fb.register_existing(d.path()).unwrap();
+        let proj = d.path().join("proj");
+        fb.create_subvolume(&proj).unwrap();
+        fs::write(proj.join("a"), "1").unwrap();
+        let snap = d.path().join("s1");
+        fb.snapshot(&proj, &snap, true).unwrap();
+        let s = fb.subvol_info(&snap).unwrap();
+        let before = fb.subvol_info(&proj).unwrap();
+        assert_eq!(fb.inode_changed_after(&proj, s.otransid).unwrap(), Some(false));
+
+        fb.balance();
+        fb.sync(d.path()).unwrap();
+        let after = fb.subvol_info(&proj).unwrap();
+        assert!(after.generation > s.otransid, "balance moves generation");
+        assert_eq!(after.ctransid, before.ctransid, "but not ctransid");
+        assert!(fb.subvol_info(&snap).unwrap().generation > s.otransid, "read-only snapshots too");
+        assert_eq!(fb.inode_changed_after(&proj, s.otransid).unwrap(), Some(false), "no inode moved");
+
+        fb.touch_inode_only(&proj).unwrap();
+        let replayed = fb.subvol_info(&proj).unwrap();
+        assert_eq!(replayed.ctransid, before.ctransid);
+        assert_eq!(fb.inode_changed_after(&proj, s.otransid).unwrap(), Some(true), "inode update seen");
+
+        fs::write(proj.join("a"), "2").unwrap();
+        fb.sync(d.path()).unwrap();
+        assert_eq!(fb.inode_changed_after(&proj, replayed.generation).unwrap(), Some(true), "content change seen");
+
+        fb.set_privileged(false);
+        assert_eq!(fb.inode_changed_after(&proj, 0).unwrap(), None, "needs CAP_SYS_ADMIN");
+        assert_eq!(fb.ops().iter().filter(|o| o.starts_with("search")).count(), 4);
     }
 
     #[test]

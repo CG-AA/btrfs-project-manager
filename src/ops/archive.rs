@@ -34,9 +34,11 @@ pub fn archive(ctx: &Ctx, a: ArchiveArgs) -> Result<()> {
             // in-place writes reach the counters only when flushed
             ctx.btrfs.sync(pref.path())?;
             let live = ctx.btrfs.subvol_info(pref.path())?;
-            match newest(&snaps) {
-                Some(n) if crate::policy::change::identical(&live, n) => n.clone(),
-                _ => {
+            let same = newest(&snaps)
+                .filter(|n| observe::changed(ctx, pref.path(), &live, Some(n), Some(&mut st)).identical());
+            match same {
+                Some(n) => n.clone(),
+                None => {
                     let target = Target::for_project(&pref, &eff);
                     let m = snapshot::take(ctx, &target, &SnapOpts::new(SnapshotKind::Manual, "archive"))?;
                     snaps.push(m.clone());

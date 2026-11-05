@@ -2,7 +2,7 @@
 //!     scripts/e2e.sh            (creates a loop device, builds, runs these with sudo)
 //! Every test works in its own subvolume under $BPM_E2E_MNT.
 
-use bpm::btrfs::ioctl::get_subvol_info;
+use bpm::btrfs::ioctl::{get_subvol_info, inode_newer_than};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -185,7 +185,7 @@ fn e2e_adopt_snapshot_and_change_detection() {
     assert_eq!(t.snapshots("demo").len(), 2, "content change: snapshot");
     t.as_user(&format!("chmod 600 {}/src/f6.rs", t.p("demo").display()));
     t.ok(&["tick"]);
-    assert_eq!(t.snapshots("demo").len(), 3, "mode-only change detected through generation");
+    assert_eq!(t.snapshots("demo").len(), 3, "mode-only change detected");
     t.ok(&["tick"]);
     assert_eq!(t.snapshots("demo").len(), 3);
 
@@ -473,4 +473,52 @@ fn e2e_project_hook_runs_as_owner_without_groups() {
     t.ok(&["snap", "demo"]);
     let got = fs::read_to_string(&out).unwrap();
     assert_eq!(got, format!("{}\n{}\n", t.uid, t.gid), "uid, then only the primary group");
+}
+
+/// A balance rewrites the tree (generation moves, ctransid does not): bpm must not call that a
+/// change. A chmod must still be one, whichever counter the kernel moves for it.
+#[test]
+#[ignore]
+fn e2e_balance_rewrites_trees_without_changing_content() {
+    let t = setup!("balance");
+    t.make_project("demo");
+    t.ok(&["adopt", "demo"]);
+    t.ok(&["tick"]);
+    let snaps = t.snapshots("demo");
+    assert_eq!(snaps.len(), 1);
+    let otransid = snaps[0]["snapshot_otransid"].as_u64().unwrap();
+    let live = t.p("demo");
+    sh("sync");
+    let before = get_subvol_info(&live).unwrap();
+
+    let mnt = std::env::var("BPM_E2E_MNT").unwrap();
+    sh(&format!("btrfs balance start -dusage=100 -musage=100 {mnt} >/dev/null"));
+    sh("sync");
+    let after = get_subvol_info(&live).unwrap();
+    assert!(after.generation > otransid, "premise: balance moves generation ({} -> {})", otransid, after.generation);
+    assert_eq!(after.ctransid, before.ctransid, "premise: balance does not move ctransid");
+    assert_eq!(inode_newer_than(&live, otransid).unwrap(), Some(false), "no inode item newer after a balance");
+
+    t.ok(&["tick"]);
+    assert_eq!(t.snapshots("demo").len(), 1, "balance alone: no snapshot");
+    let st = t.json(&["status", "demo"]);
+    assert_eq!(st["change"], "none", "{st}");
+    assert_eq!(st["state"]["clean"]["snapshot"], 1, "{st}");
+
+    t.as_user(&format!("chmod 600 {}/src/f6.rs", live.display()));
+    sh("sync");
+    let chmod = get_subvol_info(&live).unwrap();
+    eprintln!(
+        "chmod 600 moved: ctransid {} -> {} ({}), generation {} -> {}",
+        after.ctransid,
+        chmod.ctransid,
+        if chmod.ctransid == after.ctransid { "unchanged" } else { "bumped" },
+        after.generation,
+        chmod.generation
+    );
+    assert_eq!(inode_newer_than(&live, otransid).unwrap(), Some(true), "the chmod updated an inode item");
+    t.ok(&["tick"]);
+    let snaps = t.snapshots("demo");
+    assert_eq!(snaps.len(), 2, "chmod after a balance: snapshot");
+    eprintln!("snapshot #2 reason: {}", snaps[1]["reason"]);
 }

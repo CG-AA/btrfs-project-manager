@@ -6,7 +6,6 @@ use crate::error::refused;
 use crate::mechanics::snapshot::{self, SnapOpts};
 use crate::mechanics::{Target, observe};
 use crate::output::emit;
-use crate::policy::change;
 use crate::project;
 use crate::store::{Frozen, SnapshotKind, newest};
 use anyhow::Result;
@@ -47,10 +46,13 @@ pub fn unfreeze(ctx: &Ctx, a: UnfreezeArgs) -> Result<()> {
     let mut snaps = pref.unit.snapshots()?;
     let _ = ctx.btrfs.sync(pref.path());
     let live = ctx.btrfs.subvol_info(pref.path()).ok().filter(|i| i.uuid == pref.record.uuid);
+    let same = live.as_ref().is_some_and(|l| {
+        newest(&snaps).is_some_and(|n| observe::changed(ctx, pref.path(), l, Some(n), Some(&mut st)).identical())
+    });
     match (live, newest(&snaps).cloned()) {
         // the live project is gone (orphaned): the newest snapshot is all there is
         (None, _) => {}
-        (Some(live), Some(n)) if change::identical(&live, &n) => {
+        (Some(_), Some(n)) if same => {
             if n.stats.is_none() {
                 let mut n = n;
                 snapshot::count_stats(ctx, &lu, &target, &mut n, eff.policy.snapshot.stats_budget)?;

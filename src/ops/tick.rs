@@ -582,7 +582,7 @@ fn container_step(ctx: &Ctx, root: &RootCfg, store: &Store) -> Result<(Option<u6
     let mut snaps = unit.snapshots()?;
     let mut took = None;
     let due = newest(&snaps).is_none_or(|n| age(now, n.created) >= root.container.interval);
-    if due && change::changed_since(&info, newest(&snaps)) {
+    if due && !observe::changed_persisted(ctx, &unit, &root.path, &info, newest(&snaps))?.identical() {
         let t = Target {
             unit: &unit,
             name: CONTAINER,
@@ -621,7 +621,7 @@ fn heavy_candidates(
     ctx: &Ctx,
     pref: &ProjectRef,
     eff: &EffectiveConfig,
-    st: &ProjectState,
+    st: &mut ProjectState,
     snaps: &[SnapshotMeta],
     now: jiff::Timestamp,
 ) -> Result<Vec<Heavy>> {
@@ -634,7 +634,8 @@ fn heavy_candidates(
         && age(now, pref.record.adopted) >= eff.policy.lifecycle.adopt_grace
     {
         let live_now = ctx.btrfs.subvol_info(pref.path())?;
-        let identical = newest(snaps).is_some_and(|n| change::identical(&live_now, n));
+        let identical = newest(snaps)
+            .is_some_and(|n| observe::changed(ctx, pref.path(), &live_now, Some(n), Some(&mut *st)).identical());
         let counted = newest(snaps).is_some_and(|n| n.complete_stats().is_some());
         if st.collapse_incomplete_ctransid == Some(live_now.ctransid) {
             // counting this state already exceeded the stats budget; wait for a change
@@ -658,9 +659,15 @@ fn heavy_for_project(ctx: &Ctx, root: &RootCfg, store: &Store, f: &Found) -> Res
     if !eff.managed {
         return Ok(vec![]);
     }
-    let st = lu.read_state()?;
+    let mut st = lu.read_state()?;
+    let before = st.clone();
     let snaps = lu.snapshots()?;
-    heavy_candidates(ctx, &pref, &eff, &st, &snaps, ctx.now())
+    let out = heavy_candidates(ctx, &pref, &eff, &mut st, &snaps, ctx.now())?;
+    // keep what the change check learned (a balance), or `tick --heavy-only` asks every run
+    if st != before {
+        lu.write_state(&st)?;
+    }
+    Ok(out)
 }
 
 fn project_step(ctx: &Ctx, pref: &ProjectRef, f: &Found, heavy: &mut Vec<Heavy>) -> Result<ProjectTick> {
@@ -717,9 +724,11 @@ fn project_step(ctx: &Ctx, pref: &ProjectRef, f: &Found, heavy: &mut Vec<Heavy>)
     }
     let live = ctx.btrfs.subvol_info(pref.path())?;
     let free = ctx.free_bytes(pref.path())?;
+    let live_change = observe::changed(ctx, pref.path(), &live, newest(&snaps), Some(&mut st));
     let decision = change::decide_auto_snapshot(&SnapInputs {
         live: &live,
         newest: newest(&snaps),
+        change: live_change,
         now,
         min_interval: eff.policy.snapshot.min_interval,
         free,
@@ -786,7 +795,7 @@ fn project_step(ctx: &Ctx, pref: &ProjectRef, f: &Found, heavy: &mut Vec<Heavy>)
             st.warned.insert(key, now);
         }
     }
-    heavy.extend(heavy_candidates(ctx, pref, &eff, &st, &snaps, now)?);
+    heavy.extend(heavy_candidates(ctx, pref, &eff, &mut st, &snaps, now)?);
     st.last_tick = Some(now);
     st.last_error = None;
     pt.stage = st.stage.to_string();

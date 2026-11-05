@@ -73,6 +73,10 @@ impl Btrfs for RealBtrfs {
         Ok(())
     }
 
+    fn inode_changed_after(&self, subvol: &Path, transid: u64) -> Result<Option<bool>> {
+        ioctl::inode_newer_than(subvol, transid)
+    }
+
     fn create_subvolume(&self, path: &Path) -> Result<()> {
         self.run(&[os("subvolume"), os("create"), path.as_os_str()]).map(|_| ())
     }

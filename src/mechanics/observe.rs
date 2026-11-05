@@ -9,8 +9,9 @@ use crate::btrfs::SubvolInfo;
 use crate::config::EffectiveConfig;
 use crate::ctx::Ctx;
 use crate::hooks::{self, HookCtx, HookEvent};
-use crate::policy::{change, lifecycle, shrink};
-use crate::store::{LockedUnit, ProjectState, SnapshotMeta, Stage, newest};
+use crate::policy::change::{self, Change, Delta};
+use crate::policy::{lifecycle, shrink};
+use crate::store::{CleanMark, LockedUnit, ProjectState, SnapshotMeta, Stage, newest};
 use crate::util::time::age;
 use anyhow::Result;
 use jiff::Timestamp;
@@ -25,6 +26,75 @@ pub enum Walk {
     Throttled,
     /// Always walk (explicit commands such as `unfreeze`).
     Always,
+}
+
+/// Does live differ from `reference`? `live` must be read after a `sync`, just before this call.
+///
+/// The counters settle most cases. When only `generation` moved (a balance rewrote the tree, or
+/// an inode update skipped `ctransid`), ask the kernel whether any inode item is newer than the
+/// snapshot. A clean answer is remembered in `st` for this snapshot and generation, so a
+/// balance costs one search per project, not one per tick. A change after `live` was read moves
+/// `generation` past the remembered one and is checked again.
+pub fn changed(
+    ctx: &Ctx,
+    live_path: &Path,
+    live: &SubvolInfo,
+    reference: Option<&SnapshotMeta>,
+    st: Option<&mut ProjectState>,
+) -> Change {
+    let Some(snap) = reference else {
+        return Change::Content;
+    };
+    match change::delta(live, snap) {
+        Delta::Unchanged => Change::None,
+        Delta::Content => Change::Content,
+        Delta::TreeOnly => {
+            if st
+                .as_ref()
+                .and_then(|s| s.clean)
+                .is_some_and(|c| c.snapshot == snap.id && c.generation >= live.generation)
+            {
+                return Change::None;
+            }
+            match ctx.btrfs.inode_changed_after(live_path, snap.snapshot_otransid) {
+                Ok(Some(true)) => Change::Inode,
+                Ok(Some(false)) => {
+                    tracing::debug!(
+                        "{}: tree rewritten since snapshot #{} (balance?), no inode newer; unchanged",
+                        live_path.display(),
+                        snap.id
+                    );
+                    if let Some(st) = st {
+                        st.clean = Some(CleanMark { snapshot: snap.id, generation: live.generation });
+                    }
+                    Change::None
+                }
+                Ok(None) => Change::Unverified,
+                Err(e) => {
+                    tracing::warn!("{}: inode check failed: {e:#}", live_path.display());
+                    Change::Unverified
+                }
+            }
+        }
+    }
+}
+
+/// `changed` for a unit whose state is used for nothing else (the container): read the cache
+/// from its state file and write it back when the check learned something.
+pub fn changed_persisted(
+    ctx: &Ctx,
+    lu: &LockedUnit,
+    live_path: &Path,
+    live: &SubvolInfo,
+    reference: Option<&SnapshotMeta>,
+) -> Result<Change> {
+    let mut st = lu.read_state()?;
+    let before = st.clone();
+    let c = changed(ctx, live_path, live, reference, Some(&mut st));
+    if st != before {
+        lu.write_state(&st)?;
+    }
+    Ok(c)
 }
 
 /// Count live changes since the previous observation as user activity. Returns true when the
@@ -73,6 +143,7 @@ pub fn note_replaced_live(st: &mut ProjectState, live: &SubvolInfo, now: Timesta
     st.tool_ctransid = live.ctransid;
     st.last_change_at = Some(now);
     st.collapse_incomplete_ctransid = None;
+    st.clean = None;
 }
 
 /// Fresh derived state for a new live subvolume (adopt, recreate, unarchive) whose first
@@ -91,6 +162,7 @@ pub fn init_new_live(
     st.seen_ctransid = info.ctransid;
     st.tool_ctransid = info.ctransid;
     st.collapse_incomplete_ctransid = None;
+    st.clean = None;
     note_snapshot(st, meta);
     accept_as_reference(st, meta);
     st.last_change_at = Some(last_change.min(now));

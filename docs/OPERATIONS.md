@@ -134,6 +134,9 @@ directory was inside. Compare it with the project, copy back what you need, then
 - `bpm archive --delete-live` deletes the live project only if it is still identical to the
   archived snapshot; an edit during compression, or archiving an older `--snapshot`, keeps it.
 - Changes are detected when the filesystem flushes. Every check forces a flush first.
+- `btrfs balance` (and metadata defragmentation) is not a change: the tick confirms with a root-only
+  inode search that no file moved, and takes no snapshot. Until a root tick has checked,
+  `bpm status <project>` run as a user shows "tree rewritten since newest snapshot (balance?)".
 
 ## Checks after deployment
 
